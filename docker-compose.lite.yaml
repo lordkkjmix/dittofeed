@@ -28,8 +28,8 @@ services:
       resources:
         limits:
           memory: ${LITE_CONTAINER_MEM_LIMIT:-1024}m
-    ports:
-      - "3000:3000"
+    #ports:
+    #  - "3000:3000"
     depends_on:
       - postgres
       - temporal
@@ -82,8 +82,8 @@ services:
       kompose.volume.type: configMap
     networks:
       - dittofeed-network-lite
-    ports:
-      - 7233:7233
+    #ports:
+    #  - 7233:7233
     volumes:
       - ./packages/backend-lib/temporal-dynamicconfig:/etc/temporal/config/dynamicconfig
   temporal-ui:
@@ -100,8 +100,8 @@ services:
     image: temporalio/ui:${TEMPORAL_UI_VERSION:-2.22.1}
     networks:
       - dittofeed-network-lite
-    ports:
-      - 8080:8080
+    #ports:
+    #  - 8080:8080
   postgres:
     image: postgres:${POSTGRES_VERSION:-15}
     restart: always
@@ -111,8 +111,8 @@ services:
       - POSTGRES_PASSWORD=${DATABASE_PASSWORD:-password}
       - POSTGRES_USER=${DATABASE_USER:-postgres}
       - POSTGRES_DB=dittofeed
-    ports:
-      - "5432:5432"
+    #ports:
+    #  - "5432:5432"
     volumes:
       - postgres:/var/lib/postgresql/data
     networks:
@@ -128,10 +128,10 @@ services:
           memory: ${CLICKHOUSE_CONTAINER_MEM_LIMIT:-1024}m
     environment:
       <<: *clickhouse-credentials
-    ports:
-      - "8123:8123"
-      - "9000:9000"
-      - "9009:9009"
+    #ports:
+    #  - "8123:8123"
+    #  - "9000:9000"
+    #  - "9009:9009"
     volumes:
       - clickhouse_lib:/var/lib/clickhouse
       - clickhouse_log:/var/log/clickhouse-server
@@ -143,9 +143,9 @@ services:
     profiles: ["blob-storage"]
     logging:
       driver: "local"
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+    #ports:
+    #  - "9000:9000"
+    #  - "9001:9001"
     environment:
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: password

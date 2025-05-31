@@ -1,7 +1,6 @@
 import { Typography, useTheme } from "@mui/material";
 import Stack from "@mui/material/Stack";
 import { schemaValidate } from "isomorphic-lib/src/resultHandling/schemaValidation";
-import { CompletionStatus } from "isomorphic-lib/src/types";
 import { useRouter } from "next/router";
 import { useMemo } from "react";
 
@@ -9,33 +8,31 @@ import UsersTableV2, {
   usersTablePaginationHandler,
   UsersTableParams,
 } from "../../../components/usersTableV2";
-import { useAppStore } from "../../../lib/appStore";
+import { useSegmentQuery } from "../../../lib/useSegmentQuery";
 import getSegmentServerSideProps from "./getSegmentServerSideProps";
 import SegmentLayout from "./segmentLayout";
 
 export const getServerSideProps = getSegmentServerSideProps;
 
 export default function SegmentUsers() {
-  const editedSegment = useAppStore((state) => state.editedSegment);
   const theme = useTheme();
   const router = useRouter();
-  const workspace = useAppStore((state) => state.workspace);
   const queryParams = useMemo(
     () => schemaValidate(router.query, UsersTableParams).unwrapOr({}),
     [router.query],
   );
+  const segmentId =
+    typeof router.query.id === "string" ? router.query.id : null;
 
-  if (!editedSegment) {
+  const { data: segment } = useSegmentQuery(segmentId ?? undefined);
+
+  if (!segmentId) {
     return null;
   }
 
-  if (workspace.type !== CompletionStatus.Successful) {
-    return null;
-  }
-  const { name } = editedSegment;
   const onUsersTablePaginate = usersTablePaginationHandler(router);
   return (
-    <SegmentLayout segmentId={editedSegment.id} tab="users">
+    <SegmentLayout segmentId={segmentId} tab="users">
       <Stack
         spacing={1}
         sx={{
@@ -45,13 +42,18 @@ export default function SegmentUsers() {
           backgroundColor: theme.palette.grey[100],
         }}
       >
-        <Typography variant="h4">Users in &quot;{name}&quot;</Typography>
-        <UsersTableV2
-          workspaceId={workspace.value.id}
-          segmentFilter={[editedSegment.id]}
-          {...queryParams}
-          onPaginationChange={onUsersTablePaginate}
-        />
+        {segment ? (
+          <>
+            <Typography variant="h4">
+              Users in &quot;{segment.name}&quot;
+            </Typography>
+            <UsersTableV2
+              segmentFilter={[segmentId]}
+              {...queryParams}
+              onPaginationChange={onUsersTablePaginate}
+            />
+          </>
+        ) : null}
       </Stack>
     </SegmentLayout>
   );

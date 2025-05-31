@@ -34,6 +34,15 @@ export const addWorkspacesSignalV2 = defineSignal<[WorkspaceQueueSignal]>(
 
 export const getQueueSizeQuery = defineQuery<number>("getQueueSizeQuery");
 
+export interface QueueState {
+  priorityQueue: WorkspaceQueueItem[];
+  membership: string[];
+  inFlightTaskIds: string[];
+  totalProcessed: number;
+}
+
+export const getQueueStateQuery = defineQuery<QueueState>("getQueueStateQuery");
+
 /**
  * Activities
  */
@@ -58,7 +67,7 @@ interface InFlightTask {
  * 2. Longer maxPeriod comes first
  * 3. Earlier insertion order comes first
  */
-function compareWorkspaceItems(
+export function compareWorkspaceItems(
   a: WorkspaceQueueItem,
   b: WorkspaceQueueItem,
 ): number {
@@ -69,11 +78,12 @@ function compareWorkspaceItems(
     if (a.priority !== b.priority) return b.priority - a.priority; // Reverse the order so higher numbers come first
   }
 
-  // Next, compare by maxPeriod (undefined is lowest priority)
-  if (a.maxPeriod !== undefined && b.maxPeriod === undefined) return -1;
-  if (a.maxPeriod === undefined && b.maxPeriod !== undefined) return 1;
+  // Next, compare by maxPeriod (undefined comes FIRST)
+  if (a.maxPeriod === undefined && b.maxPeriod !== undefined) return -1; // a (undefined) comes first
+  if (a.maxPeriod !== undefined && b.maxPeriod === undefined) return 1; // b (undefined) comes first
   if (a.maxPeriod !== undefined && b.maxPeriod !== undefined) {
-    if (a.maxPeriod !== b.maxPeriod) return b.maxPeriod - a.maxPeriod;
+    // If both are defined, longer maxPeriod comes first
+    if (a.maxPeriod !== b.maxPeriod) return a.maxPeriod - b.maxPeriod;
   }
 
   // Finally, compare by insertion order
@@ -212,6 +222,19 @@ export async function computePropertiesQueueWorkflow(
   // QUERY HANDLER: Return how many items are in the queue
   //
   setHandler(getQueueSizeQuery, () => priorityQueue.length);
+
+  //
+  // QUERY HANDLER: Return detailed queue state
+  //
+  setHandler(
+    getQueueStateQuery,
+    (): QueueState => ({
+      priorityQueue,
+      membership: Array.from(membership),
+      inFlightTaskIds: inFlight.map((task) => task.id),
+      totalProcessed,
+    }),
+  );
 
   //
   // MAIN LOOP (streaming concurrency approach)

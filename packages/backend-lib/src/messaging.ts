@@ -6,6 +6,7 @@ import { and, eq, SQL } from "drizzle-orm";
 import { toMjml } from "emailo/src/toMjml";
 import { CHANNEL_IDENTIFIERS } from "isomorphic-lib/src/channels";
 import { MESSAGE_ID_HEADER, SecretNames } from "isomorphic-lib/src/constants";
+import { isWorkspaceWideProvider } from "isomorphic-lib/src/email";
 import { messageTemplateDraftToDefinition } from "isomorphic-lib/src/messageTemplates";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import {
@@ -49,7 +50,13 @@ import {
 import {
   Sender as TwilioSender,
   sendSms as sendSmsTwilio,
+  TwilioAuth,
 } from "./destinations/twilio";
+import {
+  getAndRefreshGmailAccessToken,
+  sendGmailEmail,
+  SendGmailEmailParams,
+} from "./gmail";
 import { renderLiquid } from "./liquid";
 import logger from "./logger";
 import {
@@ -66,9 +73,9 @@ import {
   BadWorkspaceConfigurationType,
   BlobStorageFile,
   ChannelType,
-  EmailProvider,
   EmailProviderSecret,
   EmailProviderType,
+  EmailProviderTypeSchema,
   InternalEventType,
   MessageSendFailure,
   MessageSkippedType,
@@ -97,6 +104,7 @@ import {
   WebhookSecret,
 } from "./types";
 import { UserPropertyAssignments } from "./userProperties";
+import { isWorkspaceOccupantType } from "./workspaceOccupantSettings";
 
 export function enrichMessageTemplate({
   id,
@@ -189,6 +197,7 @@ export async function upsertMessageTemplate(
         name: data.name,
         definition: data.definition,
         draft: data.draft,
+        resourceType: data.resourceType,
       })
       .onConflictDoUpdate({
         target: data.id
@@ -198,6 +207,7 @@ export async function upsertMessageTemplate(
           name: data.name,
           definition: data.definition,
           draft: data.draft,
+          resourceType: data.resourceType,
         },
         setWhere: eq(dbMessageTemplate.workspaceId, data.workspaceId),
       })
@@ -368,7 +378,7 @@ export interface SendMessageParametersBase {
 
 export interface SendMessageParametersEmail extends SendMessageParametersBase {
   channel: (typeof ChannelType)["Email"];
-  providerOverride?: EmailProviderType;
+  providerOverride?: EmailProviderTypeSchema;
 }
 
 export type SendMessageParametersSms = SendMessageParametersBase &
@@ -514,8 +524,6 @@ function getMessageFileId({
   return `${messageId}-${name}`;
 }
 
-type EmailProviderPayload = (EmailProvider & { secret: Secret | null }) | null;
-
 function getWebsiteFromFromEmail(from: string): string | null {
   const fromParts = from.split("@");
   if (fromParts.length !== 2 || !fromParts[1]) {
@@ -529,13 +537,13 @@ function getWebsiteFromFromEmail(from: string): string | null {
   }
 }
 
-async function getEmailProviderForWorkspace({
+async function getEmailProviderSecretForWorkspace({
   providerOverride,
   workspaceId,
 }: {
   workspaceId: string;
-  providerOverride?: EmailProviderType;
-}): Promise<EmailProviderPayload> {
+  providerOverride?: EmailProviderTypeSchema;
+}): Promise<Secret | null> {
   if (providerOverride) {
     const provider = await db().query.emailProvider.findFirst({
       where: and(
@@ -546,7 +554,7 @@ async function getEmailProviderForWorkspace({
         secret: true,
       },
     });
-    return provider ?? null;
+    return provider?.secret ?? null;
   }
   const defaultProvider = await db().query.defaultEmailProvider.findFirst({
     where: eq(dbDefaultEmailProvider.workspaceId, workspaceId),
@@ -559,23 +567,29 @@ async function getEmailProviderForWorkspace({
     },
   });
 
-  return defaultProvider?.emailProvider ?? null;
+  return defaultProvider?.emailProvider?.secret ?? null;
 }
 
-async function getEmailProvider({
-  providerOverride,
+const PROVIDER_NOT_FOUND_ERROR = {
+  type: InternalEventType.BadWorkspaceConfiguration,
+  variant: {
+    type: BadWorkspaceConfigurationType.MessageServiceProviderNotFound,
+  },
+} as const;
+
+async function getEmailProviderSecretForWorkspaceHierarchical({
   workspaceId,
+  providerOverride,
 }: {
   workspaceId: string;
-  providerOverride?: EmailProviderType;
-}): Promise<EmailProviderPayload> {
-  const provider = await getEmailProviderForWorkspace({
+  providerOverride?: EmailProviderTypeSchema;
+}): Promise<Secret | null> {
+  const secret = await getEmailProviderSecretForWorkspace({
     workspaceId,
     providerOverride,
   });
-  logger().debug({ provider }, "email provider");
-  if (provider) {
-    return provider;
+  if (secret) {
+    return secret;
   }
   const workspace = await db().query.workspace.findFirst({
     where: eq(dbWorkspace.id, workspaceId),
@@ -584,10 +598,102 @@ async function getEmailProvider({
   if (!parentWorkspaceId) {
     return null;
   }
-  return getEmailProviderForWorkspace({
+  return getEmailProviderSecretForWorkspace({
     workspaceId: parentWorkspaceId,
     providerOverride,
   });
+}
+
+async function getEmailProvider({
+  providerOverride,
+  workspaceId,
+  workspaceOccupantId,
+  workspaceOccupantType,
+}: {
+  workspaceId: string;
+  providerOverride?: EmailProviderTypeSchema;
+  workspaceOccupantId?: string;
+  workspaceOccupantType?: string;
+}): Promise<Result<EmailProviderSecret, MessageSendFailure>> {
+  let emailProviderSecret: EmailProviderSecret | null = null;
+  if (providerOverride && !isWorkspaceWideProvider(providerOverride)) {
+    if (
+      !workspaceOccupantId ||
+      !isWorkspaceOccupantType(workspaceOccupantType)
+    ) {
+      logger().error(
+        {
+          workspaceId,
+          workspaceOccupantId,
+          workspaceOccupantType,
+        },
+        "email provider not found for non-workspace-wide provider. workspaceOccupantId and workspaceOccupantType must be provided.",
+      );
+      return err(PROVIDER_NOT_FOUND_ERROR);
+    }
+    switch (providerOverride) {
+      case EmailProviderType.Gmail: {
+        const gmailCredentials = await getAndRefreshGmailAccessToken({
+          workspaceId,
+          workspaceOccupantId,
+          workspaceOccupantType,
+        });
+        if (!gmailCredentials) {
+          logger().info(
+            {
+              workspaceId,
+              workspaceOccupantId,
+              workspaceOccupantType,
+            },
+            "gmail credentials not found",
+          );
+          return err(PROVIDER_NOT_FOUND_ERROR);
+        }
+        emailProviderSecret = {
+          type: EmailProviderType.Gmail,
+          email: gmailCredentials.email,
+          accessToken: gmailCredentials.accessToken,
+          refreshToken: gmailCredentials.refreshToken,
+          expiresAt: gmailCredentials.expiresAt,
+        };
+        break;
+      }
+      default:
+        assertUnreachable(providerOverride);
+    }
+  } else {
+    const secret = await getEmailProviderSecretForWorkspaceHierarchical({
+      workspaceId,
+      providerOverride,
+    });
+    if (!secret) {
+      logger().info(
+        {
+          workspaceId,
+          providerOverride,
+        },
+        "email provider not found for workspace",
+      );
+      return err(PROVIDER_NOT_FOUND_ERROR);
+    }
+
+    const secretConfigResult = schemaValidateWithErr(
+      secret.configValue,
+      EmailProviderSecret,
+    );
+    if (secretConfigResult.isErr()) {
+      return err({
+        type: InternalEventType.BadWorkspaceConfiguration,
+        variant: {
+          type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+          message:
+            "Application error: message service provider config malformed.",
+        },
+      });
+    }
+    emailProviderSecret = secretConfigResult.value;
+  }
+  return ok(emailProviderSecret);
 }
 
 export async function sendEmail({
@@ -603,7 +709,7 @@ export async function sendEmail({
   SendMessageParametersEmail,
   "channel"
 >): Promise<BackendMessageSendResult> {
-  const [getSendModelsResult, emailProvider] = await Promise.all([
+  const [getSendModelsResult, emailProviderResult] = await Promise.all([
     getSendMessageModels({
       workspaceId,
       templateId,
@@ -614,6 +720,8 @@ export async function sendEmail({
     getEmailProvider({
       workspaceId,
       providerOverride,
+      workspaceOccupantId: messageTags?.workspaceOccupantId,
+      workspaceOccupantType: messageTags?.workspaceOccupantType,
     }),
   ]);
   if (getSendModelsResult.isErr()) {
@@ -621,15 +729,6 @@ export async function sendEmail({
   }
   const { messageTemplateDefinition, subscriptionGroupSecret } =
     getSendModelsResult.value;
-
-  if (!emailProvider) {
-    return err({
-      type: InternalEventType.BadWorkspaceConfiguration,
-      variant: {
-        type: BadWorkspaceConfigurationType.MessageServiceProviderNotFound,
-      },
-    });
-  }
 
   if (messageTemplateDefinition.type !== ChannelType.Email) {
     return err({
@@ -797,41 +896,6 @@ export async function sendEmail({
     ...unsubscribeHeaders,
   };
 
-  const unvalidatedSecretConfig = emailProvider.secret?.configValue;
-
-  if (!unvalidatedSecretConfig) {
-    return err({
-      type: InternalEventType.BadWorkspaceConfiguration,
-      variant: {
-        type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-        message:
-          "Missing messaging service provider config. Configure in settings.",
-      },
-    });
-  }
-
-  const secretConfigResult = schemaValidateWithErr(
-    emailProvider.secret?.configValue,
-    EmailProviderSecret,
-  );
-  if (secretConfigResult.isErr()) {
-    logger().error(
-      {
-        err: secretConfigResult.error,
-        unvalidatedSecretConfig,
-      },
-      "message service provider config malformed",
-    );
-    return err({
-      type: InternalEventType.BadWorkspaceConfiguration,
-      variant: {
-        type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-        message:
-          "Application error: message service provider config malformed.",
-      },
-    });
-  }
-  const secretConfig = secretConfigResult.value;
   let attachments: Attachment[] | undefined;
   if (
     messageTemplateDefinition.attachmentUserProperties?.length &&
@@ -892,18 +956,14 @@ export async function sendEmail({
     mimeType,
   }));
 
+  if (emailProviderResult.isErr()) {
+    return err(emailProviderResult.error);
+  }
+  const emailProvider = emailProviderResult.value;
+
   switch (emailProvider.type) {
     case EmailProviderType.Smtp: {
-      if (secretConfig.type !== EmailProviderType.Smtp) {
-        return err({
-          type: InternalEventType.BadWorkspaceConfiguration,
-          variant: {
-            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected smtp secret config but got ${secretConfig.type}`,
-          },
-        });
-      }
-      const { host, port } = secretConfig;
+      const { host, port } = emailProvider;
       if (!host) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
@@ -932,7 +992,7 @@ export async function sendEmail({
         }));
 
       const result = await sendMailSmtp({
-        ...secretConfig,
+        ...emailProvider,
         from,
         to,
         subject,
@@ -976,17 +1036,7 @@ export async function sendEmail({
         },
       });
     }
-    case EmailProviderType.Sendgrid: {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      if (secretConfig.type !== EmailProviderType.Sendgrid) {
-        return err({
-          type: InternalEventType.BadWorkspaceConfiguration,
-          variant: {
-            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected sendgrid secret config but got ${secretConfig.type}`,
-          },
-        });
-      }
+    case EmailProviderType.SendGrid: {
       const sendgridAttachments: MailDataRequired["attachments"] =
         messageTags &&
         attachments?.map((attachment) => ({
@@ -1018,7 +1068,7 @@ export async function sendEmail({
         },
       };
 
-      if (!secretConfig.apiKey) {
+      if (!emailProvider.apiKey) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
@@ -1030,7 +1080,7 @@ export async function sendEmail({
 
       const result = await sendMailSendgrid({
         mailData,
-        apiKey: secretConfig.apiKey,
+        apiKey: emailProvider.apiKey,
       });
 
       if (result.isErr()) {
@@ -1039,7 +1089,7 @@ export async function sendEmail({
           variant: {
             type: ChannelType.Email,
             provider: {
-              type: EmailProviderType.Sendgrid,
+              type: EmailProviderType.SendGrid,
               // Necessary because the types on sendgrid's lib are wrong
               body: JSON.stringify(result.error.response.body),
               status: result.error.code,
@@ -1062,22 +1112,12 @@ export async function sendEmail({
           name: emailName,
           attachments: attachmentsSent,
           provider: {
-            type: EmailProviderType.Sendgrid,
+            type: EmailProviderType.SendGrid,
           },
         },
       });
     }
     case EmailProviderType.AmazonSes: {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      if (secretConfig.type !== EmailProviderType.AmazonSes) {
-        return err({
-          type: InternalEventType.BadWorkspaceConfiguration,
-          variant: {
-            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected amazon secret config but got ${secretConfig.type}`,
-          },
-        });
-      }
       const sesAttachments = attachments?.map((attachment) => ({
         filename: attachment.name,
         content: attachment.data,
@@ -1103,9 +1143,9 @@ export async function sendEmail({
       };
 
       if (
-        !secretConfig.accessKeyId ||
-        !secretConfig.secretAccessKey ||
-        !secretConfig.region
+        !emailProvider.accessKeyId ||
+        !emailProvider.secretAccessKey ||
+        !emailProvider.region
       ) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
@@ -1119,9 +1159,9 @@ export async function sendEmail({
       const result = await sendMailAmazonSes({
         mailData,
         config: {
-          accessKeyId: secretConfig.accessKeyId,
-          secretAccessKey: secretConfig.secretAccessKey,
-          region: secretConfig.region,
+          accessKeyId: emailProvider.accessKeyId,
+          secretAccessKey: emailProvider.secretAccessKey,
+          region: emailProvider.region,
         },
       });
 
@@ -1174,18 +1214,72 @@ export async function sendEmail({
       });
     }
 
-    case EmailProviderType.Resend: {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      if (secretConfig.type !== EmailProviderType.Resend) {
+    case EmailProviderType.Gmail: {
+      if (!emailProvider.accessToken) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
             type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected resend secret config but got ${secretConfig.type}`,
+            message: "Failed to get or refresh Gmail access token",
           },
         });
       }
 
+      const gmailAttachments: SendGmailEmailParams["attachments"] =
+        attachments?.map((attachment) => ({
+          filename: attachment.name,
+          content: attachment.data,
+          contentType: attachment.mimeType,
+        }));
+
+      const gmailResult = await sendGmailEmail({
+        accessToken: emailProvider.accessToken,
+        params: {
+          to,
+          from,
+          subject,
+          bodyHtml: body,
+          replyTo,
+          cc,
+          bcc,
+          headers,
+          attachments: gmailAttachments,
+        },
+      });
+
+      if (gmailResult.isErr()) {
+        return err({
+          type: InternalEventType.MessageFailure,
+          variant: {
+            type: ChannelType.Email,
+            provider: gmailResult.error,
+          },
+        });
+      }
+      return ok({
+        type: InternalEventType.MessageSent,
+        variant: {
+          type: ChannelType.Email,
+          from,
+          body,
+          to,
+          subject,
+          headers,
+          replyTo,
+          cc: unsplitCc,
+          bcc: unsplitBcc,
+          name: emailName,
+          attachments: attachmentsSent,
+          provider: {
+            type: EmailProviderType.Gmail,
+            messageId: gmailResult.value.messageId,
+            threadId: gmailResult.value.threadId,
+          },
+        },
+      });
+    }
+
+    case EmailProviderType.Resend: {
       const resendAttachments: ResendRequiredData["attachments"] =
         attachments?.map((attachment) => ({
           filename: attachment.name,
@@ -1210,7 +1304,7 @@ export async function sendEmail({
         attachments: resendAttachments,
       };
 
-      if (!secretConfig.apiKey) {
+      if (!emailProvider.apiKey) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
@@ -1222,7 +1316,7 @@ export async function sendEmail({
 
       const result = await sendMailResend({
         mailData,
-        apiKey: secretConfig.apiKey,
+        apiKey: emailProvider.apiKey,
       });
 
       if (result.isErr()) {
@@ -1259,17 +1353,6 @@ export async function sendEmail({
       });
     }
     case EmailProviderType.PostMark: {
-      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-      if (secretConfig.type !== EmailProviderType.PostMark) {
-        return err({
-          type: InternalEventType.BadWorkspaceConfiguration,
-          variant: {
-            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected postmark secret config but got ${secretConfig.type}`,
-          },
-        });
-      }
-
       const postmarkAttachments: PostMarkRequiredFields["Attachments"] =
         messageTags
           ? attachments?.map(({ mimeType, data, name }) => ({
@@ -1308,7 +1391,7 @@ export async function sendEmail({
         },
       };
 
-      if (!secretConfig.apiKey) {
+      if (!emailProvider.apiKey) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
@@ -1320,7 +1403,7 @@ export async function sendEmail({
 
       const result = await sendMailPostMark({
         mailData,
-        apiKey: secretConfig.apiKey,
+        apiKey: emailProvider.apiKey,
       });
 
       if (result.isErr()) {
@@ -1404,17 +1487,7 @@ export async function sendEmail({
         metadata,
       };
 
-      if (secretConfig.type !== EmailProviderType.MailChimp) {
-        return err({
-          type: InternalEventType.BadWorkspaceConfiguration,
-          variant: {
-            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `expected mailchimp secret config but got ${secretConfig.type}`,
-          },
-        });
-      }
-
-      if (!secretConfig.apiKey) {
+      if (!emailProvider.apiKey) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
@@ -1425,7 +1498,7 @@ export async function sendEmail({
       }
 
       const result = await sendMailMailchimp({
-        apiKey: secretConfig.apiKey,
+        apiKey: emailProvider.apiKey,
         message: mailData,
       });
 
@@ -1639,17 +1712,46 @@ export async function sendSms(
         });
       }
 
-      const { accountSid, authToken, messagingServiceSid } = configResult.value;
+      const {
+        accountSid,
+        authToken,
+        messagingServiceSid,
+        apiKeySid,
+        apiKeySecret,
+      } = configResult.value;
 
-      if (!accountSid || !authToken || !messagingServiceSid) {
+      if (!accountSid) {
         return err({
           type: InternalEventType.BadWorkspaceConfiguration,
           variant: {
             type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
-            message: `missing accountSid, authToken, or messagingServiceSid in sms provider config`,
+            message: `missing accountSid in sms provider config`,
           },
         });
       }
+      let auth: TwilioAuth;
+      if (apiKeySid && apiKeySecret) {
+        auth = {
+          type: "apiKey",
+          apiKeySid,
+          apiKeySecret,
+        };
+      } else if (authToken) {
+        auth = {
+          type: "authToken",
+          authToken,
+        };
+      } else {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message:
+              "twilio auth must provider either an auth token or api key sid and secret",
+          },
+        });
+      }
+
       let sender: TwilioSender;
       const { senderOverride } = params;
       if (providerOverride === SmsProviderType.Twilio && senderOverride) {
@@ -1667,16 +1769,25 @@ export async function sendSms(
           default:
             assertUnreachable(senderOverride);
         }
-      } else {
+      } else if (messagingServiceSid) {
         sender = {
           messagingServiceSid,
         };
+      } else {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message:
+              "twilio sender must provide either a messaging service sid or a sender override",
+          },
+        });
       }
 
       const result = await sendSmsTwilio({
         body,
         accountSid,
-        authToken,
+        auth,
         userId,
         subscriptionGroupId: subscriptionGroupDetails?.id,
         to,

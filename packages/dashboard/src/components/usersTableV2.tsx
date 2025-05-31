@@ -13,7 +13,6 @@ import {
   Autocomplete,
   Box,
   Button,
-  ButtonProps,
   Chip,
   CircularProgress,
   Dialog,
@@ -41,12 +40,7 @@ import {
   useTheme,
 } from "@mui/material";
 import { Type } from "@sinclair/typebox";
-import {
-  keepPreviousData,
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { keepPreviousData } from "@tanstack/react-query";
 import {
   ColumnDef,
   flexRender,
@@ -54,23 +48,23 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import axios from "axios";
-import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
-import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
+import deepEqual from "fast-deep-equal";
 import {
-  CompletionStatus,
   CursorDirectionEnum,
-  DeleteUsersRequest,
   GetUsersRequest,
-  GetUsersResponse,
   GetUsersResponseItem,
   GetUsersUserPropertyFilter,
 } from "isomorphic-lib/src/types";
 import Link from "next/link";
 import { NextRouter, useRouter } from "next/router";
-import React, { useCallback, useMemo } from "react";
+import React, { useCallback, useEffect, useMemo } from "react";
 import { useImmer } from "use-immer";
 
-import { useAppStore, useAppStorePick } from "../lib/appStore";
+import { useAppStore } from "../lib/appStore";
+import { useDeleteUserMutation } from "../lib/useDeleteUserMutation";
+import { useUsersCountQuery } from "../lib/useUsersCountQuery";
+import { useUsersQuery } from "../lib/useUsersQuery";
+import { GreyButton } from "./greyButtonStyle";
 import { greyTextFieldStyles } from "./greyScaleStyles";
 import { SquarePaper } from "./squarePaper";
 import {
@@ -390,16 +384,8 @@ const segmentsCellRenderer = ({
 }) => <SegmentsCell segments={row.original.segments} />;
 
 // Actions menu item
-function ActionsCell({
-  userId,
-  onOptimisticDelete,
-}: {
-  userId: string;
-  onOptimisticDelete?: (userId: string) => void;
-}) {
+function ActionsCell({ userId }: { userId: string }) {
   const theme = useTheme();
-  const { apiBase, workspace } = useAppStorePick(["apiBase", "workspace"]);
-  const queryClient = useQueryClient();
   const [anchorEl, setAnchorEl] = React.useState<HTMLElement | null>(null);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
   const [deleteSuccess, setDeleteSuccess] = React.useState(false);
@@ -407,51 +393,7 @@ function ActionsCell({
   const [errorMessage, setErrorMessage] = React.useState("");
   const open = Boolean(anchorEl);
 
-  // Get workspaceId from the workspace object
-  const workspaceId =
-    workspace.type === CompletionStatus.Successful ? workspace.value.id : "";
-
-  const deleteUserMutation = useMutation({
-    mutationFn: async () => {
-      if (!workspaceId) {
-        throw new Error("Workspace ID not available");
-      }
-
-      const response = await axios.delete(`${apiBase}/api/users`, {
-        data: {
-          workspaceId,
-          userIds: [userId],
-        } satisfies DeleteUsersRequest,
-      });
-      return response.data;
-    },
-    onMutate: () => {
-      // Optimistically update the UI by removing the user from the table
-      onOptimisticDelete?.(userId);
-    },
-    onSuccess: () => {
-      setDeleteSuccess(true);
-
-      // Invalidate and refetch the users and usersCount queries
-      queryClient.invalidateQueries({ queryKey: ["users"] });
-      queryClient.invalidateQueries({ queryKey: ["usersCount"] });
-    },
-    onError: (error) => {
-      console.error("Failed to delete user:", error);
-      setDeleteError(true);
-
-      // Extract error message from the error response if available
-      if (axios.isAxiosError(error) && error.response?.data?.message) {
-        setErrorMessage(error.response.data.message);
-      } else {
-        setErrorMessage("Failed to delete user. Please try again.");
-      }
-
-      // Since the optimistic update already happened, we need to refetch to restore data
-      queryClient.invalidateQueries({ queryKey: ["users"] });
-      queryClient.invalidateQueries({ queryKey: ["usersCount"] });
-    },
-  });
+  const deleteUserMutation = useDeleteUserMutation();
 
   const handleClick = (event: React.MouseEvent<HTMLElement>) => {
     setAnchorEl(event.currentTarget);
@@ -471,7 +413,22 @@ function ActionsCell({
   };
 
   const handleConfirmDelete = () => {
-    deleteUserMutation.mutate();
+    deleteUserMutation.mutate([userId], {
+      onSuccess: () => {
+        setDeleteSuccess(true);
+      },
+      onError: (error) => {
+        setDeleteError(true);
+        if (axios.isAxiosError(error) && error.response?.data) {
+          const errorData = error.response.data as { message?: string };
+          setErrorMessage(
+            errorData.message ?? "Failed to delete user. Please try again.",
+          );
+        } else {
+          setErrorMessage("Failed to delete user. Please try again.");
+        }
+      },
+    });
     handleConfirmClose();
   };
 
@@ -597,22 +554,14 @@ function ActionsCell({
   );
 }
 
-const actionsCellRenderer = ({
-  row,
-  table,
-}: {
-  row: { original: { id: string } };
-  table: {
-    options: { meta?: { performOptimisticDelete?: (userId: string) => void } };
+const actionsCellRendererFactory = () => {
+  return function ActionsCellRenderer({
+    row,
+  }: {
+    row: { original: { id: string } };
+  }) {
+    return <ActionsCell userId={row.original.id} />;
   };
-}) => {
-  const onOptimisticDelete = table.options.meta?.performOptimisticDelete;
-  return (
-    <ActionsCell
-      userId={row.original.id}
-      onOptimisticDelete={onOptimisticDelete}
-    />
-  );
 };
 
 export const UsersTableParams = Type.Pick(GetUsersRequest, [
@@ -632,11 +581,12 @@ export function usersTablePaginationHandler(router: NextRouter) {
       cursor: existingCursor,
       ...remainingParams
     } = router.query;
+    // existingDirection and existingCursor are intentionally not used here.
+    // We only care about the remainingParams to construct the new query.
 
     const newQuery: Record<string, string | string[] | undefined> = {
       ...remainingParams,
     };
-    // delete cursor and direction from newQuery if they don't exist
     if (direction) {
       newQuery.direction = direction;
     }
@@ -661,44 +611,17 @@ interface Row {
   }[];
 }
 
-export const greyButtonStyle = {
-  bgcolor: "grey.200",
-  color: "grey.700",
-  "&:hover": {
-    bgcolor: "grey.300",
-  },
-  "&:active": {
-    bgcolor: "grey.400",
-  },
-  "&.Mui-disabled": {
-    bgcolor: "grey.100",
-    color: "grey.400",
-  },
-} as const;
-
-function GreyButton(props: ButtonProps) {
-  const { sx, ...rest } = props;
-  return (
-    <Button
-      {...rest}
-      sx={{
-        ...greyButtonStyle,
-        ...sx,
-      }}
-    />
-  );
-}
-
 export type OnPaginationChangeProps = Pick<
   GetUsersRequest,
   "direction" | "cursor"
 >;
 
-export type UsersTableProps = Omit<GetUsersRequest, "limit"> & {
-  onPaginationChange: (args: OnPaginationChangeProps) => void;
+export type UsersTableProps = Omit<GetUsersRequest, "workspaceId"> & {
+  onPaginationChange?: (args: OnPaginationChangeProps) => void;
   autoReloadByDefault?: boolean;
   reloadPeriodMs?: number;
   userUriTemplate?: string;
+  hideControls?: boolean;
 };
 
 interface TableState {
@@ -706,6 +629,7 @@ interface TableState {
   users: Record<string, GetUsersResponseItem>;
   usersCount: number | null;
   currentPageUserIds: string[];
+  currentCursor: string | null;
   previousCursor: string | null;
   nextCursor: string | null;
   query: {
@@ -715,28 +639,7 @@ interface TableState {
   };
 }
 
-export const defaultGetUsersRequest = function getUsersRequest({
-  params,
-  apiBase,
-}: {
-  params: GetUsersRequest;
-  apiBase: string;
-}) {
-  return axios.post(`${apiBase}/api/users`, params);
-};
-
-export const getUsersCountRequest = function getUsersCountRequest({
-  params,
-  apiBase,
-}: {
-  params: Omit<GetUsersRequest, "cursor" | "direction" | "limit">;
-  apiBase: string;
-}) {
-  return axios.post(`${apiBase}/api/users/count`, params);
-};
-
 export default function UsersTableV2({
-  workspaceId,
   segmentFilter: segmentIds,
   subscriptionGroupFilter: subscriptionGroupIds,
   direction,
@@ -745,9 +648,10 @@ export default function UsersTableV2({
   autoReloadByDefault = false,
   reloadPeriodMs = 10000,
   userUriTemplate = "/users/{userId}",
+  limit,
+  hideControls = false,
 }: UsersTableProps) {
-  const apiBase = useAppStore((store) => store.apiBase);
-
+  useAppStore();
   const [userFilterState, userFilterUpdater] = useUserFilterState({
     segments: segmentIds ? new Set(segmentIds) : undefined,
     staticSegments: segmentIds ? new Set(segmentIds) : undefined,
@@ -759,24 +663,66 @@ export default function UsersTableV2({
       : undefined,
   });
 
+  useEffect(() => {
+    userFilterUpdater((draft) => {
+      const oldStaticSegments = draft.staticSegments;
+      const newStaticSegments = new Set(segmentIds);
+      if (
+        deepEqual(Array.from(oldStaticSegments), Array.from(newStaticSegments))
+      ) {
+        return draft;
+      }
+
+      for (const segmentId of oldStaticSegments) {
+        draft.segments.delete(segmentId);
+        draft.staticSegments.delete(segmentId);
+      }
+
+      for (const segmentId of newStaticSegments) {
+        draft.segments.add(segmentId);
+        draft.staticSegments.add(segmentId);
+      }
+      return draft;
+    });
+  }, [segmentIds, userFilterUpdater]);
+
+  useEffect(() => {
+    userFilterUpdater((draft) => {
+      const oldStaticSubscriptionGroups = draft.staticSubscriptionGroups;
+      for (const subscriptionGroupId of oldStaticSubscriptionGroups) {
+        draft.subscriptionGroups.delete(subscriptionGroupId);
+        draft.staticSubscriptionGroups.delete(subscriptionGroupId);
+      }
+
+      const newStaticSubscriptionGroups = new Set(subscriptionGroupIds);
+      for (const subscriptionGroupId of newStaticSubscriptionGroups) {
+        draft.subscriptionGroups.add(subscriptionGroupId);
+        draft.staticSubscriptionGroups.add(subscriptionGroupId);
+      }
+    });
+  }, [subscriptionGroupIds, userFilterUpdater]);
+
   const [state, setState] = useImmer<TableState>({
     autoReload: autoReloadByDefault,
     query: {
       cursor: cursor ?? null,
       direction: direction ?? null,
-      limit: 10,
+      limit: limit ?? 10,
     },
     users: {},
-    usersCount: null,
     currentPageUserIds: [],
+    currentCursor: cursor ?? null,
     nextCursor: null,
     previousCursor: null,
+    usersCount: null,
   });
 
-  const filtersHash = useUserFiltersHash(userFilterState);
+  useUserFiltersHash(userFilterState);
 
-  // Function to prepare common filter parameters for both queries
-  const getCommonQueryParams = useCallback(() => {
+  const getCommonQueryParams = useCallback((): Omit<
+    GetUsersRequest,
+    "workspaceId" | "limit" | "cursor" | "direction"
+  > => {
     const requestUserPropertyFilter: GetUsersUserPropertyFilter | undefined =
       userFilterState.userProperties.size > 0
         ? Array.from(userFilterState.userProperties).map((up) => ({
@@ -808,87 +754,92 @@ export default function UsersTableV2({
         allFilterSubscriptionGroups.size > 0
           ? Array.from(allFilterSubscriptionGroups)
           : undefined,
-      workspaceId,
       userPropertyFilter: requestUserPropertyFilter,
     };
-  }, [userFilterState, segmentIds, subscriptionGroupIds, workspaceId]);
+  }, [userFilterState, segmentIds, subscriptionGroupIds]);
 
-  // Query for fetching users count
-  const countQuery = useQuery({
-    queryKey: [
-      "usersCount",
-      workspaceId,
-      segmentIds,
-      subscriptionGroupIds,
-      filtersHash,
-    ],
-    placeholderData: keepPreviousData,
-    queryFn: async () => {
-      const commonParams = getCommonQueryParams();
+  const commonQueryListParams = useMemo(
+    () => getCommonQueryParams(),
+    [getCommonQueryParams],
+  );
 
-      try {
-        const response = await getUsersCountRequest({
-          params: commonParams,
-          apiBase,
-        });
-
-        return response.data.userCount;
-      } catch (error) {
-        console.error("Failed to fetch users count", error);
-        throw error;
-      }
-    },
+  const countQuery = useUsersCountQuery(commonQueryListParams, {
     refetchInterval: state.autoReload ? reloadPeriodMs : false,
+    placeholderData: keepPreviousData,
   });
 
-  // Main query for fetching users
-  const query = useQuery<GetUsersResponse>({
-    queryKey: ["users", state.query, segmentIds, filtersHash],
-    queryFn: async () => {
-      const commonParams = getCommonQueryParams();
+  const usersListQuery = useUsersQuery(
+    {
+      ...commonQueryListParams,
+      cursor: state.query.cursor ?? undefined,
+      direction: state.query.direction ?? undefined,
+      limit: state.query.limit,
+    },
+    {
+      refetchInterval: state.autoReload ? reloadPeriodMs : false,
+      placeholderData: keepPreviousData,
+    },
+  );
 
-      const params: GetUsersRequest = {
-        ...commonParams,
-        cursor: state.query.cursor ?? undefined,
-        direction: state.query.direction ?? undefined,
-        limit: state.query.limit,
-      };
-
-      const response = await defaultGetUsersRequest({
-        params,
-        apiBase,
-      });
-
-      const result = unwrap(
-        schemaValidateWithErr(response.data, GetUsersResponse),
-      );
-
-      if (result.users.length === 0 && cursor) {
-        if (state.query.direction === CursorDirectionEnum.Before) {
-          setState((draft) => {
-            draft.nextCursor = null;
-            draft.previousCursor = null;
-            draft.query.cursor = null;
-            draft.query.direction = null;
-          });
-          onPaginationChange({});
-        }
+  useEffect(() => {
+    if (usersListQuery.data) {
+      const result = usersListQuery.data;
+      if (
+        result.users.length < state.query.limit &&
+        state.query.direction === CursorDirectionEnum.Before
+      ) {
+        setState((draft) => {
+          draft.nextCursor = null;
+          draft.previousCursor = null;
+          draft.query.cursor = null;
+          draft.query.direction = null;
+          draft.currentCursor = null;
+        });
+        onPaginationChange?.({});
+      } else if (
+        result.users.length === 0 &&
+        state.query.direction === CursorDirectionEnum.After
+      ) {
+        // Rollback to the last cursor if the next page is empty.
+        setState((draft) => {
+          draft.query.cursor = state.currentCursor;
+        });
+        onPaginationChange?.({
+          cursor: state.currentCursor ?? undefined,
+        });
       } else {
         setState((draft) => {
-          for (const user of result.users) {
-            draft.users[user.id] = user;
-          }
-          draft.currentPageUserIds = result.users.map((u) => u.id);
+          const newUsersMap: Record<string, GetUsersResponseItem> = {};
+          result.users.forEach((user: GetUsersResponseItem) => {
+            newUsersMap[user.id] = user;
+          });
+          draft.users = newUsersMap;
+          draft.currentPageUserIds = result.users.map(
+            (u: GetUsersResponseItem) => u.id,
+          );
           draft.nextCursor = result.nextCursor ?? null;
           draft.previousCursor = result.previousCursor ?? null;
+          draft.currentCursor = state.query.cursor ?? null;
         });
       }
+    }
+  }, [
+    usersListQuery.data,
+    setState,
+    onPaginationChange,
+    cursor,
+    state.query.direction,
+    state.query.cursor,
+    state.currentCursor,
+  ]);
 
-      return result;
-    },
-    placeholderData: keepPreviousData,
-    refetchInterval: state.autoReload ? reloadPeriodMs : false,
-  });
+  useEffect(() => {
+    if (countQuery.data !== undefined) {
+      setState((draft) => {
+        draft.usersCount = countQuery.data;
+      });
+    }
+  }, [countQuery.data, setState]);
 
   const usersData = useMemo<Row[]>(() => {
     return state.currentPageUserIds.flatMap((id) => {
@@ -897,23 +848,28 @@ export default function UsersTableV2({
         return [];
       }
 
-      // Find the email property if it exists
       let email = "";
       for (const propId in user.properties) {
         const prop = user.properties[propId];
         if (prop && prop.name.toLowerCase() === "email") {
-          email = prop.value;
+          email = prop.value as string;
           break;
         }
       }
 
-      return {
-        id: user.id,
-        email,
-        segments: user.segments,
-      };
+      return [
+        {
+          id: user.id,
+          email,
+          segments: user.segments,
+        },
+      ];
     });
   }, [state.currentPageUserIds, state.users]);
+
+  const actionsCellRenderer = useMemo(() => {
+    return actionsCellRendererFactory();
+  }, []);
 
   const columns = useMemo<ColumnDef<Row>[]>(
     () => [
@@ -942,30 +898,7 @@ export default function UsersTableV2({
         cell: actionsCellRenderer,
       },
     ],
-    [userUriTemplate],
-  );
-
-  // Function to optimistically delete a user from the table
-  const performOptimisticDelete = useCallback(
-    (userId: string) => {
-      setState((draft) => {
-        // Remove user from currentPageUserIds array
-        draft.currentPageUserIds = draft.currentPageUserIds.filter(
-          (id) => id !== userId,
-        );
-
-        // Remove user from users object
-        if (draft.users[userId]) {
-          delete draft.users[userId];
-        }
-
-        // Decrement the count if it exists
-        if (draft.usersCount !== null) {
-          draft.usersCount -= 1;
-        }
-      });
-    },
-    [setState],
+    [userUriTemplate, actionsCellRenderer],
   );
 
   const table = useReactTable({
@@ -973,14 +906,11 @@ export default function UsersTableV2({
     data: usersData,
     manualPagination: true,
     getCoreRowModel: getCoreRowModel(),
-    meta: {
-      performOptimisticDelete,
-    },
   });
 
   const onNextPage = useCallback(() => {
     if (state.nextCursor) {
-      onPaginationChange({
+      onPaginationChange?.({
         cursor: state.nextCursor,
         direction: CursorDirectionEnum.After,
       });
@@ -993,28 +923,32 @@ export default function UsersTableV2({
 
   const onPreviousPage = useCallback(() => {
     if (state.previousCursor) {
-      onPaginationChange({
-        cursor: state.previousCursor,
-        direction: CursorDirectionEnum.Before,
-      });
       setState((draft) => {
-        draft.query.cursor = state.previousCursor;
-        draft.query.direction = CursorDirectionEnum.Before;
+        if (draft.query.direction === CursorDirectionEnum.Before) {
+          draft.query.cursor = state.previousCursor;
+        } else if (draft.query.direction === CursorDirectionEnum.After) {
+          draft.query.direction = CursorDirectionEnum.Before;
+        }
+        onPaginationChange?.({
+          cursor: draft.query.cursor ?? undefined,
+          direction: draft.query.direction ?? undefined,
+        });
       });
     }
   }, [state.previousCursor, onPaginationChange, setState]);
 
   const onFirstPage = useCallback(() => {
-    onPaginationChange({});
+    onPaginationChange?.({});
     setState((draft) => {
       draft.query.cursor = null;
+      draft.query.direction = null;
     });
   }, [onPaginationChange, setState]);
 
   const handleRefresh = useCallback(() => {
-    query.refetch();
+    usersListQuery.refetch();
     countQuery.refetch();
-  }, [query, countQuery]);
+  }, [usersListQuery, countQuery]);
 
   const toggleAutoRefresh = useCallback(() => {
     setState((draft) => {
@@ -1022,18 +956,10 @@ export default function UsersTableV2({
     });
   }, [setState]);
 
-  const isLoading = query.isPending || query.isFetching;
-
-  return (
-    <Stack
-      spacing={1}
-      sx={{
-        width: "100%",
-        height: "100%",
-        minWidth: 0,
-        alignItems: "stretch",
-      }}
-    >
+  const isLoading = usersListQuery.isPending || usersListQuery.isFetching;
+  let controls: React.ReactNode = null;
+  if (!hideControls) {
+    controls = (
       <Stack
         direction="row"
         alignItems="center"
@@ -1073,6 +999,20 @@ export default function UsersTableV2({
           </IconButton>
         </Tooltip>
       </Stack>
+    );
+  }
+
+  return (
+    <Stack
+      spacing={1}
+      sx={{
+        width: "100%",
+        height: "100%",
+        minWidth: 0,
+        alignItems: "stretch",
+      }}
+    >
+      {controls}
       <TableContainer component={Paper}>
         <Table stickyHeader>
           <TableHead>
@@ -1178,7 +1118,8 @@ export default function UsersTableV2({
                             height: "100%",
                           }}
                         >
-                          Total users: {countQuery.data ?? 0}
+                          Total users:{" "}
+                          {countQuery.data ?? state.usersCount ?? 0}
                         </Typography>
                       </Stack>
                     )}

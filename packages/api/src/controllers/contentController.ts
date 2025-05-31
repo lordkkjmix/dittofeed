@@ -9,18 +9,17 @@ import {
   SendMessageParameters,
   upsertMessageTemplate,
 } from "backend-lib/src/messaging";
-import { defaultEmailDefinition } from "backend-lib/src/messaging/email";
-import { defaultSmsDefinition } from "backend-lib/src/messaging/sms";
-import { DEFAULT_WEBHOOK_DEFINITION } from "backend-lib/src/messaging/webhook";
 import { Secret } from "backend-lib/src/types";
 import { randomUUID } from "crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, SQL } from "drizzle-orm";
 import { toMjml } from "emailo/src/toMjml";
 import { FastifyInstance } from "fastify";
 import { CHANNEL_IDENTIFIERS } from "isomorphic-lib/src/channels";
 import { SecretNames } from "isomorphic-lib/src/constants";
+import { defaultEmailDefinition } from "isomorphic-lib/src/email";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
+import { defaultSmsDefinition } from "isomorphic-lib/src/sms";
 import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import {
   BadWorkspaceConfigurationType,
@@ -52,6 +51,7 @@ import {
   UpsertMessageTemplateValidationError,
   WebhookSecret,
 } from "isomorphic-lib/src/types";
+import { DEFAULT_WEBHOOK_DEFINITION } from "isomorphic-lib/src/webhook";
 import * as R from "remeda";
 
 // eslint-disable-next-line @typescript-eslint/require-await
@@ -182,11 +182,19 @@ export default async function contentController(fastify: FastifyInstance) {
       },
     },
     async (request, reply) => {
+      const conditions: SQL[] = [
+        eq(schema.messageTemplate.workspaceId, request.query.workspaceId),
+      ];
+      if (request.query.ids) {
+        conditions.push(inArray(schema.messageTemplate.id, request.query.ids));
+      }
+      if (request.query.resourceType) {
+        conditions.push(
+          eq(schema.messageTemplate.resourceType, request.query.resourceType),
+        );
+      }
       const templateModels = await db().query.messageTemplate.findMany({
-        where: eq(
-          schema.messageTemplate.workspaceId,
-          request.query.workspaceId,
-        ),
+        where: and(...conditions),
       });
       const templates = templateModels.map((t) =>
         unwrap(enrichMessageTemplate(t)),
@@ -417,7 +425,7 @@ export default async function contentController(fastify: FastifyInstance) {
           case ChannelType.Email: {
             const { type } = result.error.variant.provider;
             switch (type) {
-              case EmailProviderType.Sendgrid: {
+              case EmailProviderType.SendGrid: {
                 const { body, status } = result.error.variant.provider;
                 const suggestions: string[] = [];
                 if (status) {
@@ -496,6 +504,9 @@ export default async function contentController(fastify: FastifyInstance) {
                     responseData: message,
                   },
                 });
+              }
+              case EmailProviderType.Gmail: {
+                throw new Error("Gmail is not supported in test mode");
               }
               default: {
                 assertUnreachable(type);

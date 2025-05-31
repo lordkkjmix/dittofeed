@@ -10,15 +10,12 @@ import {
   RenderMessageTemplateType,
   WorkspaceMemberResource,
 } from "isomorphic-lib/src/types";
-import { useMemo } from "react";
 
 import { useAppStorePick } from "../../lib/appStore";
 import TemplateEditor, {
   DraftToPreview,
   getDisabledInputStyles,
-  RenderTemplateRequest,
   TemplateEditorMode,
-  TestTemplateRequest,
 } from "../templateEditor";
 import { WebhookPreviewBody } from "./webhookPreview";
 
@@ -53,9 +50,7 @@ export default function WebhookEditor({
   disabled,
   member,
   mode,
-  renderTemplateRequest,
   defaultIsUserPropertiesMinimised,
-  testTemplateRequest,
 }: {
   templateId: string;
   hideTitle?: boolean;
@@ -63,27 +58,14 @@ export default function WebhookEditor({
   disabled?: boolean;
   member?: WorkspaceMemberResource;
   mode?: TemplateEditorMode;
-  renderTemplateRequest?: RenderTemplateRequest;
   defaultIsUserPropertiesMinimised?: boolean;
-  testTemplateRequest?: TestTemplateRequest;
 }) {
   const theme = useTheme();
-  const { messages: templates, userProperties } = useAppStorePick([
+  const { userProperties } = useAppStorePick([
     "messages",
     "viewDraft",
     "userProperties",
   ]);
-  const template = useMemo(
-    () =>
-      templates.type === CompletionStatus.Successful
-        ? templates.value.find((t) => t.id === templateId)
-        : undefined,
-    [templates, templateId],
-  );
-
-  if (template?.type !== ChannelType.Webhook) {
-    return null;
-  }
 
   return (
     <TemplateEditor
@@ -196,9 +178,7 @@ export default function WebhookEditor({
       draftToPreview={draftToPreview}
       fieldToReadable={fieldToReadable}
       mode={mode}
-      renderTemplateRequest={renderTemplateRequest}
       defaultIsUserPropertiesMinimised={defaultIsUserPropertiesMinimised}
-      testTemplateRequest={testTemplateRequest}
     />
   );
 }

@@ -125,6 +125,8 @@ const BaseRawConfigProps = {
   enableAdditionalDashboardSettings: Type.Optional(BoolStr),
   additionalDashboardSettingsPath: Type.Optional(Type.String()),
   additionalDashboardSettingsTitle: Type.Optional(Type.String()),
+  gmailClientId: Type.Optional(Type.String()),
+  gmailClientSecret: Type.Optional(Type.String()),
 };
 
 function defaultTemporalAddress(inputURL?: string): string {
@@ -575,7 +577,7 @@ function parseRawConfig(rawConfig: RawConfig): Config {
     useGlobalComputedProperties:
       rawConfig.useGlobalComputedProperties === undefined
         ? undefined
-        : rawConfig.useGlobalComputedProperties === "true",
+        : rawConfig.useGlobalComputedProperties !== "false",
   };
 
   return parsedConfig;

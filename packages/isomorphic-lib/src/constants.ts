@@ -3,7 +3,11 @@ import {
   EmailProviderType,
   InternalEventType,
   JourneyNodeType,
+  SegmentDefinition,
+  SegmentNodeType,
+  SegmentOperatorType,
   SmsProviderType,
+  WorkspaceWideEmailProviders,
 } from "./types";
 
 export * from "./constants/headers";
@@ -16,7 +20,7 @@ export const DEBUG_USER_ID1 = "1b9858de-907d-493f-a067-b3c8effecb0b" as const;
 
 export enum SecretNames {
   Twilio = "twilio-key",
-  Sendgrid = "sendgrid",
+  SendGrid = "sendgrid",
   AmazonSes = "amazonses",
   Resend = "resend",
   Postmark = "postmark",
@@ -40,10 +44,10 @@ export const SMS_PROVIDER_TYPE_TO_SECRET_NAME: Record<SmsProviderType, string> =
   };
 
 export const EMAIL_PROVIDER_TYPE_TO_SECRET_NAME: Record<
-  EmailProviderType,
+  WorkspaceWideEmailProviders,
   string
 > = {
-  [EmailProviderType.Sendgrid]: SecretNames.Sendgrid,
+  [EmailProviderType.SendGrid]: SecretNames.SendGrid,
   [EmailProviderType.AmazonSes]: SecretNames.AmazonSes,
   [EmailProviderType.Smtp]: SecretNames.Smtp,
   [EmailProviderType.Resend]: SecretNames.Resend,
@@ -86,3 +90,27 @@ export enum SourceType {
 }
 
 export const WORKSPACE_TOMBSTONE_PREFIX = "DfTombstoned";
+
+const ENTRY_ID = "entry";
+const INIT_TRAIT_ID = "initTraitId";
+
+export const DEFAULT_SEGMENT_DEFINITION: SegmentDefinition = {
+  entryNode: {
+    type: SegmentNodeType.And,
+    children: [INIT_TRAIT_ID],
+    id: ENTRY_ID,
+  },
+  nodes: [
+    {
+      type: SegmentNodeType.Trait,
+      id: INIT_TRAIT_ID,
+      path: "",
+      operator: {
+        type: SegmentOperatorType.Equals,
+        value: "",
+      },
+    },
+  ],
+};
+
+export const OAUTH_COOKIE_NAME = "oauth_csrf_token";

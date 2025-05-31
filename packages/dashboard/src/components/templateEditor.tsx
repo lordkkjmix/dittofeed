@@ -28,10 +28,12 @@ import {
 } from "@mui/material";
 import { TransitionProps } from "@mui/material/transitions";
 import ReactCodeMirror from "@uiw/react-codemirror";
-import axios, { AxiosRequestConfig, AxiosResponse } from "axios";
 import hash from "fnv1a";
 import { CHANNEL_IDENTIFIERS } from "isomorphic-lib/src/channels";
-import { emailProviderLabel } from "isomorphic-lib/src/email";
+import {
+  emailProviderLabel,
+  getEmailContentsType,
+} from "isomorphic-lib/src/email";
 import { deepEquals } from "isomorphic-lib/src/equality";
 import {
   messageTemplateDefinitionToDraft,
@@ -46,19 +48,15 @@ import {
   ChannelType,
   CompletionStatus,
   EmailProviderType,
-  EphemeralRequestStatus,
+  EmailProviderTypeSchema,
   InternalEventType,
   JsonResultType,
-  MessageTemplateResource,
   MessageTemplateResourceDraft,
   MessageTemplateTestRequest,
-  MessageTemplateTestResponse,
   MobilePushProviderType,
   RenderMessageTemplateRequest,
   RenderMessageTemplateRequestContents,
-  RenderMessageTemplateResponse,
   SmsProviderType,
-  UpsertMessageTemplateResource,
   UserPropertyAssignments,
   UserPropertyResource,
   WorkspaceMemberResource,
@@ -70,14 +68,24 @@ import React, { useEffect, useMemo } from "react";
 import { useDebounce } from "use-debounce";
 import { useImmer } from "use-immer";
 
-import apiRequestHandlerFactory from "../lib/apiRequestHandlerFactory";
 import { useAppStorePick } from "../lib/appStore";
 import { copyToClipboard } from "../lib/copyToClipboard";
 import {
   noticeAnchorOrigin as anchorOrigin,
   noticeAnchorOrigin,
 } from "../lib/notices";
+import { useMessageTemplateQuery } from "../lib/useMessageTemplateQuery";
+import {
+  UpsertMessageTemplateParams,
+  useMessageTemplateUpdateMutation,
+} from "../lib/useMessageTemplateUpdateMutation";
+import { useRenderTemplateQuery } from "../lib/useRenderTemplateQuery";
+import {
+  TestTemplateVariables,
+  useTestTemplateMutation,
+} from "../lib/useTestTemplateMutation";
 import { useUpdateEffect } from "../lib/useUpdateEffect";
+import { useUserPropertiesQuery } from "../lib/useUserPropertiesQuery";
 import { EditableTitle } from "./editableName/v2";
 import ErrorBoundary from "./errorBoundary";
 import { SubtleHeader } from "./headers";
@@ -181,16 +189,13 @@ export interface BaseTemplateState {
     title: string;
     draft?: MessageTemplateResourceDraft;
   } | null;
-  testRequest: EphemeralRequestStatus<Error>;
-  testResponse: MessageTemplateTestResponse | null;
-  updateRequest: EphemeralRequestStatus<Error>;
   rendered: Record<string, string>;
   isUserPropertiesMinimised: boolean;
 }
 
 export interface EmailTemplateState extends BaseTemplateState {
   channel: (typeof ChannelType)["Email"];
-  providerOverride: EmailProviderType | null;
+  providerOverride: EmailProviderTypeSchema | null;
 }
 
 export interface SmsTemplateState extends BaseTemplateState {
@@ -319,26 +324,6 @@ function buildTags({
   };
 }
 
-export interface RenderTemplateRequestParams {
-  params: RenderMessageTemplateRequest;
-  apiBase: string;
-}
-
-export type RenderTemplateRequest = ({
-  apiBase,
-  params,
-}: RenderTemplateRequestParams) => Promise<AxiosResponse<unknown, unknown>>;
-
-export interface TestTemplateRequestParams {
-  params: MessageTemplateTestRequest;
-  apiBase: string;
-}
-
-export type TestTemplateRequest = ({
-  apiBase,
-  params,
-}: TestTemplateRequestParams) => AxiosRequestConfig<MessageTemplateTestRequest>;
-
 export interface TemplateEditorProps {
   channel: ChannelType;
   templateId: string;
@@ -354,31 +339,8 @@ export interface TemplateEditorProps {
   draftToPreview: DraftToPreview;
   fieldToReadable: (field: string) => string | null;
   mode?: TemplateEditorMode;
-  renderTemplateRequest?: RenderTemplateRequest;
-  testTemplateRequest?: TestTemplateRequest;
   defaultIsUserPropertiesMinimised?: boolean;
 }
-
-export const defaultRenderTemplateRequest: RenderTemplateRequest = ({
-  apiBase,
-  params,
-}) => {
-  return axios.post(`${apiBase}/api/content/templates/render`, params);
-};
-
-export const defaultTestTemplateRequest: TestTemplateRequest = ({
-  apiBase,
-  params,
-}) => {
-  return {
-    method: "POST",
-    url: `${apiBase}/api/content/templates/test`,
-    data: params,
-    headers: {
-      "Content-Type": "application/json",
-    },
-  };
-};
 
 export default function TemplateEditor({
   templateId,
@@ -395,50 +357,38 @@ export default function TemplateEditor({
   draftToPreview,
   renderEditorOptions,
   mode = ModeEnum.Full,
-  renderTemplateRequest = defaultRenderTemplateRequest,
-  testTemplateRequest = defaultTestTemplateRequest,
   defaultIsUserPropertiesMinimised = false,
 }: TemplateEditorProps) {
   const theme = useTheme();
   const router = useRouter();
+  const { data: userPropertiesResult } = useUserPropertiesQuery();
   const {
-    apiBase,
-    messages,
     workspace: workspaceResult,
-    userProperties: userPropertiesResult,
-    upsertTemplate,
     viewDraft,
     inTransition,
     setViewDraft,
   } = useAppStorePick([
-    "apiBase",
-    "messages",
     "workspace",
-    "userProperties",
-    "upsertTemplate",
     "viewDraft",
     "setViewDraft",
     "inTransition",
   ]);
-  const template = useMemo(
-    () =>
-      messages.type === CompletionStatus.Successful
-        ? messages.value.find((m) => m.id === templateId)
-        : undefined,
-    [messages, templateId],
-  );
+  const { data: template } = useMessageTemplateQuery(templateId);
+  const { mutate: updateTemplate, isPending: isUpdating } =
+    useMessageTemplateUpdateMutation();
+  const testTemplateMutation = useTestTemplateMutation();
 
   const workspace =
     workspaceResult.type === CompletionStatus.Successful
       ? workspaceResult.value
       : null;
   const initialUserProperties = useMemo(() => {
-    if (userPropertiesResult.type !== CompletionStatus.Successful) {
+    if (!userPropertiesResult) {
       return {};
     }
     return getUserPropertyValues({
       member,
-      userProperties: userPropertiesResult.value,
+      userProperties: userPropertiesResult.userProperties,
     });
   }, [userPropertiesResult, member]);
 
@@ -448,27 +398,39 @@ export default function TemplateEditor({
     userProperties: initialUserProperties,
     userPropertiesJSON: JSON.stringify(initialUserProperties, null, 2),
     errors: new Map(),
-    testResponse: null,
-    testRequest: {
-      type: CompletionStatus.NotStarted,
-    },
-    updateRequest: {
-      type: CompletionStatus.NotStarted,
-    },
     providerOverride: null,
     channel,
     rendered: {},
     isUserPropertiesMinimised: defaultIsUserPropertiesMinimised,
   });
+  useEffect(() => {
+    if (
+      !template?.definition ||
+      state.editedTemplate?.draft?.type !== "Email" ||
+      template.definition.type !== "Email"
+    ) {
+      return;
+    }
+    const currentEmailContentsType = getEmailContentsType(
+      state.editedTemplate.draft,
+    );
+    const newEmailContentsType = getEmailContentsType(template.definition);
+    if (currentEmailContentsType !== newEmailContentsType) {
+      setState((d) => {
+        if (!d.editedTemplate) {
+          return d;
+        }
+        d.editedTemplate.draft = template.draft;
+        return d;
+      });
+    }
+  }, [template, state.editedTemplate, setState]);
+
   const {
     fullscreen,
     errors,
     rendered,
-    testResponse,
-    testRequest,
-    updateRequest,
     editedTemplate,
-    userProperties,
     userPropertiesJSON,
     isUserPropertiesMinimised,
   } = state;
@@ -482,27 +444,18 @@ export default function TemplateEditor({
       draft.userProperties = initialUserProperties;
       draft.userPropertiesJSON = JSON.stringify(initialUserProperties, null, 2);
     });
-  }, [
-    initialUserProperties,
-    setState,
-    inTransition,
-    template,
-    viewDraft,
-    editedTemplate,
-  ]);
+  }, [initialUserProperties, setState, inTransition]);
 
   useEffect(() => {
     setState((draft) => {
       if (!template?.definition) {
         return;
       }
-      // initialize editedTemplate from store if not set
       if (!draft.editedTemplate) {
         draft.editedTemplate = {
           title: template.name,
           draft: template.draft,
         };
-        // handling reverts, otherwise don't overwrite draft
       } else if (!template.draft) {
         draft.editedTemplate.draft = undefined;
       }
@@ -535,74 +488,28 @@ export default function TemplateEditor({
     const publisher: PublisherOutOfDateStatus = {
       type: PublisherStatusType.OutOfDate,
       disabled: !viewDraft || errors.size > 0,
+      isUpdating,
       onPublish: () => {
-        if (!workspace) {
-          return;
-        }
-        apiRequestHandlerFactory({
-          request: updateRequest,
-          setRequest: (request) =>
-            setState((draft) => {
-              draft.updateRequest = request;
-            }),
-          responseSchema: MessageTemplateResource,
-          setResponse: upsertTemplate,
-          onSuccessNotice: "Published template draft.",
-          onFailureNoticeHandler: () =>
-            `API Error: Failed to publish template draft.`,
-          requestConfig: {
-            method: "PUT",
-            url: `${apiBase}/api/content/templates`,
-            data: {
-              workspaceId: workspace.id,
-              name: template.name,
-              id: template.id,
-              draft: null,
-              definition: definitionFromDraft,
-            } satisfies UpsertMessageTemplateResource,
-            headers: {
-              "Content-Type": "application/json",
-            },
-          },
-        })();
+        updateTemplate({
+          id: templateId,
+          name: template.name,
+          draft: null,
+          definition: definitionFromDraft,
+        });
       },
       onRevert: () => {
-        if (!workspace) {
-          return;
-        }
-        apiRequestHandlerFactory({
-          request: updateRequest,
-          setRequest: (request) =>
-            setState((draft) => {
-              draft.updateRequest = request;
-            }),
-          responseSchema: MessageTemplateResource,
-          setResponse: upsertTemplate,
-          onSuccessNotice: "Reverted template draft.",
-          onFailureNoticeHandler: () =>
-            `API Error: Failed to revert template draft.`,
-          requestConfig: {
-            method: "PUT",
-            url: `${apiBase}/api/content/templates`,
-            data: {
-              workspaceId: workspace.id,
-              name: template.name,
-              id: template.id,
-              draft: null,
-            } satisfies UpsertMessageTemplateResource,
-            headers: {
-              "Content-Type": "application/json",
-            },
-          },
-        })();
+        updateTemplate({
+          id: templateId,
+          name: template.name,
+          draft: null,
+        });
       },
-      updateRequest,
     };
 
     const draftToggle: PublisherOutOfDateToggleStatus = {
       type: PublisherStatusType.OutOfDate,
-      updateRequest,
       isDraft: viewDraft,
+      isUpdating,
       onToggle: ({ isDraft: newIsDraft }) => {
         setViewDraft(newIsDraft);
       },
@@ -614,12 +521,10 @@ export default function TemplateEditor({
     editedTemplate,
     viewDraft,
     errors.size,
-    updateRequest,
-    workspace,
-    upsertTemplate,
-    apiBase,
-    setState,
+    isUpdating,
     setViewDraft,
+    updateTemplate,
+    templateId,
   ]);
 
   const [debouncedDraft] = useDebounce(editedTemplate?.draft, 300);
@@ -629,10 +534,8 @@ export default function TemplateEditor({
     if (disabled || !workspace || !debouncedTitle) {
       return;
     }
-    const workspaceId = workspace.id;
-    const updateData: UpsertMessageTemplateResource = {
+    const updateData: UpsertMessageTemplateParams = {
       id: templateId,
-      workspaceId,
       name: debouncedTitle,
     };
     if (!hidePublisher) {
@@ -653,33 +556,21 @@ export default function TemplateEditor({
       updateData.definition = definitionFromDraft;
     }
 
-    apiRequestHandlerFactory({
-      request: updateRequest,
-      setRequest: (request) =>
-        setState((draft) => {
-          draft.updateRequest = request;
-        }),
-      responseSchema: MessageTemplateResource,
-      setResponse: upsertTemplate,
-      onFailureNoticeHandler: () => `API Error: Failed to update template.`,
-      requestConfig: {
-        method: "PUT",
-        url: `${apiBase}/api/content/templates`,
-        data: updateData,
-        headers: {
-          "Content-Type": "application/json",
-        },
-      },
-    })();
+    if (
+      updateData.draft !== undefined ||
+      updateData.definition !== undefined ||
+      debouncedTitle !== template?.name
+    ) {
+      updateTemplate(updateData);
+    }
   }, [debouncedDraft, debouncedTitle]);
 
-  const [debouncedUserProperties] = useDebounce(userProperties, 300);
+  const [debouncedUserProperties] = useDebounce(state.userProperties, 300);
 
   const draftToRender = useMemo(() => {
     if (debouncedDraft) {
       return debouncedDraft;
     }
-    // important for rendering draft on first render if present
     if (template?.draft) {
       return template.draft;
     }
@@ -689,83 +580,139 @@ export default function TemplateEditor({
     return messageTemplateDefinitionToDraft(template.definition);
   }, [debouncedDraft, template?.draft, template?.definition]);
 
-  useEffect(() => {
-    (async () => {
-      if (
-        !workspace ||
-        inTransition ||
-        !draftToRender ||
-        Object.keys(debouncedUserProperties).length === 0
-      ) {
-        return;
-      }
-
-      const data: RenderMessageTemplateRequest = {
+  const renderHookParams: Omit<
+    RenderMessageTemplateRequest,
+    "workspaceId"
+  > | null = useMemo(() => {
+    if (
+      !workspace ||
+      inTransition ||
+      !draftToRender ||
+      Object.keys(debouncedUserProperties).length === 0
+    ) {
+      return null;
+    }
+    return {
+      channel,
+      userProperties: debouncedUserProperties,
+      tags: buildTags({
         workspaceId: workspace.id,
-        channel,
-        userProperties: debouncedUserProperties,
-        tags: buildTags({
-          workspaceId: workspace.id,
-          templateId,
-          userId: debouncedUserProperties.id,
-        }),
-        contents: draftToPreview(draftToRender),
-      };
+        templateId,
+        userId: debouncedUserProperties.id,
+      }),
+      contents: draftToPreview(draftToRender),
+    };
+  }, [
+    workspace,
+    inTransition,
+    draftToRender,
+    debouncedUserProperties,
+    channel,
+    templateId,
+    draftToPreview,
+  ]);
 
-      try {
-        const response = await renderTemplateRequest({
-          apiBase,
-          params: data,
-        });
+  const renderQuery = useRenderTemplateQuery(renderHookParams, {
+    enabled: !!renderHookParams,
+  });
 
-        const { contents } = response.data as RenderMessageTemplateResponse;
+  useEffect(() => {
+    if (renderQuery.isError && renderQuery.error) {
+      enqueueSnackbar("API Error: failed to render template preview.", {
+        variant: "error",
+        autoHideDuration: 3000,
+        anchorOrigin: noticeAnchorOrigin,
+      });
+      return;
+    }
 
-        const newRendered: Record<string, string> = {};
-        const newErrors = new Map(errors);
+    if (renderQuery.data) {
+      const { contents } = renderQuery.data;
+      const newRendered: Record<string, string> = {};
+      const newErrors = new Map(state.errors);
 
-        for (const contentKey in contents) {
-          const content = contents[contentKey];
-          if (content === undefined) {
-            continue;
+      for (const contentKey in contents) {
+        const content = contents[contentKey];
+        if (content === undefined) {
+          continue;
+        }
+        const existingErr = state.errors.get(contentKey);
+        if (content.type === JsonResultType.Ok) {
+          newRendered[contentKey] = content.value;
+          if (existingErr) {
+            closeSnackbar(errorHash(contentKey, existingErr));
+            newErrors.delete(contentKey);
           }
-          const existingErr = errors.get(contentKey);
-          if (content.type === JsonResultType.Ok) {
-            newRendered[contentKey] = content.value;
-            if (existingErr) {
-              closeSnackbar(errorHash(contentKey, existingErr));
-              newErrors.delete(contentKey);
-            }
-            continue;
-          }
+        } else {
           const readable = fieldToReadable(contentKey) ?? contentKey;
           const message = `${readable} Error: ${content.err}`;
 
           if (existingErr && existingErr !== message) {
             closeSnackbar(errorHash(contentKey, existingErr));
           }
-          enqueueSnackbar(message, {
-            variant: "error",
-            persist: true,
-            key: errorHash(contentKey, message),
-            anchorOrigin,
-          });
-          newErrors.set(contentKey, message);
+          if (existingErr !== message) {
+            enqueueSnackbar(message, {
+              variant: "error",
+              persist: true,
+              key: errorHash(contentKey, message),
+              anchorOrigin,
+            });
+            newErrors.set(contentKey, message);
+          } else if (!existingErr) {
+            enqueueSnackbar(message, {
+              variant: "error",
+              persist: true,
+              key: errorHash(contentKey, message),
+              anchorOrigin,
+            });
+            newErrors.set(contentKey, message);
+          }
         }
+      }
 
+      const renderedContentChanged = !deepEquals(state.rendered, newRendered);
+
+      let errorsContentChanged = false;
+      if (state.errors.size !== newErrors.size) {
+        errorsContentChanged = true;
+      } else {
+        for (const [key, value] of state.errors.entries()) {
+          if (newErrors.get(key) !== value) {
+            errorsContentChanged = true;
+            break;
+          }
+        }
+        if (!errorsContentChanged) {
+          for (const [key, value] of newErrors.entries()) {
+            if (state.errors.get(key) !== value) {
+              errorsContentChanged = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if (renderedContentChanged || errorsContentChanged) {
         setState((draft) => {
-          draft.rendered = newRendered;
-          draft.errors = newErrors;
-        });
-      } catch (err) {
-        enqueueSnackbar("API Error: failed to render template preview.", {
-          variant: "error",
-          autoHideDuration: 3000,
-          anchorOrigin: noticeAnchorOrigin,
+          if (renderedContentChanged) {
+            draft.rendered = newRendered;
+          }
+          if (errorsContentChanged) {
+            draft.errors = newErrors;
+          }
         });
       }
-    })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedUserProperties, debouncedDraft, inTransition, viewDraft]);
+    }
+  }, [
+    renderQuery.data,
+    renderQuery.isError,
+    renderQuery.error,
+    setState,
+    errors,
+    fieldToReadable,
+    state.rendered,
+    state.errors,
+  ]);
 
   useEffect(() => {
     const exitingFunction = () => {
@@ -785,8 +732,8 @@ export default function TemplateEditor({
   useEffect(() => {
     let missingUserProperty: string | null = null;
     const userPropertySet = new Set(
-      userPropertiesResult.type === CompletionStatus.Successful
-        ? userPropertiesResult.value.map((p) => p.name)
+      userPropertiesResult
+        ? userPropertiesResult.userProperties.map((p) => p.name)
         : [],
     );
     for (const userProperty in debouncedUserProperties) {
@@ -844,7 +791,6 @@ export default function TemplateEditor({
           if (stateDraft.editedTemplate?.draft) {
             currentDefinition = stateDraft.editedTemplate.draft;
           } else if (template.definition) {
-            // Read only object can't be passed into setter, so need to clone.
             currentDefinition = messageTemplateDefinitionToDraft({
               ...template.definition,
             });
@@ -885,7 +831,7 @@ export default function TemplateEditor({
         },
       },
     ];
-  }, []);
+  }, [template?.definition]);
 
   if (!workspace || !template || !renderEditorParams) {
     return null;
@@ -893,9 +839,8 @@ export default function TemplateEditor({
 
   const submitTestDataBase: Pick<
     MessageTemplateTestRequest,
-    "workspaceId" | "templateId" | "userProperties" | "tags"
+    "templateId" | "userProperties" | "tags"
   > = {
-    workspaceId: workspace.id,
     templateId,
     userProperties: debouncedUserProperties,
     tags: buildTags({
@@ -904,31 +849,31 @@ export default function TemplateEditor({
       userId: debouncedUserProperties.id,
     }),
   };
-  let submitTestData: MessageTemplateTestRequest;
+  let submitTestDataVariables: TestTemplateVariables;
   switch (state.channel) {
     case ChannelType.Email:
-      submitTestData = {
+      submitTestDataVariables = {
         ...submitTestDataBase,
         channel: state.channel,
         provider: state.providerOverride ?? undefined,
       };
       break;
     case ChannelType.Sms:
-      submitTestData = {
+      submitTestDataVariables = {
         ...submitTestDataBase,
         channel: state.channel,
         provider: state.providerOverride ?? undefined,
       };
       break;
     case ChannelType.MobilePush:
-      submitTestData = {
+      submitTestDataVariables = {
         ...submitTestDataBase,
         channel: state.channel,
         provider: state.providerOverride ?? undefined,
       };
       break;
     case ChannelType.Webhook:
-      submitTestData = {
+      submitTestDataVariables = {
         ...submitTestDataBase,
         channel: state.channel,
       };
@@ -937,63 +882,41 @@ export default function TemplateEditor({
       assertUnreachable(state);
   }
 
-  const submitTest = apiRequestHandlerFactory({
-    request: testRequest,
-    setRequest: (request) =>
-      setState((draft) => {
-        draft.testRequest = request;
-      }),
-    responseSchema: MessageTemplateTestResponse,
-    setResponse: (response) =>
-      setState((draft) => {
-        draft.testResponse = response;
-      }),
-    onSuccessNotice: `Attempted test message.`,
-    onFailureNoticeHandler: () => `API Error: Failed to attempt test message.`,
-    requestConfig: testTemplateRequest({
-      apiBase,
-      params: submitTestData,
-    }),
-  });
-
   let testModalContents: React.ReactNode = null;
-  if (testResponse) {
-    if (
-      testResponse.type === JsonResultType.Ok &&
-      testResponse.value.type === InternalEventType.MessageSent &&
-      testResponse.value.variant.type === channel
-    ) {
-      const { to } = testResponse.value.variant;
 
+  if (testTemplateMutation.isSuccess && testTemplateMutation.data) {
+    const testResponseData = testTemplateMutation.data;
+    if (
+      testResponseData.type === JsonResultType.Ok &&
+      testResponseData.value.type === InternalEventType.MessageSent &&
+      testResponseData.value.variant.type === channel
+    ) {
+      const { to } = testResponseData.value.variant;
       let responseEl: React.ReactNode | null = null;
-      switch (testResponse.value.variant.type) {
-        case ChannelType.Webhook: {
-          const { response } = testResponse.value.variant;
-          responseEl = (
-            <Stack spacing={1}>
-              <SubtleHeader>Response</SubtleHeader>
-              <ReactCodeMirror
-                value={JSON.stringify(response, null, 2)}
-                height="100%"
-                readOnly
-                editable={false}
-                extensions={[
-                  codeMirrorJson(),
-                  linter(jsonParseLinter()),
-                  EditorView.lineWrapping,
-                  EditorView.editable.of(false),
-                  EditorView.theme({
-                    "&": {
-                      fontFamily: theme.typography.fontFamily,
-                    },
-                  }),
-                  lintGutter(),
-                ]}
-              />
-            </Stack>
-          );
-          break;
-        }
+      if (testResponseData.value.variant.type === ChannelType.Webhook) {
+        const { response: webhookResponseData } =
+          testResponseData.value.variant;
+        responseEl = (
+          <Stack spacing={1}>
+            <SubtleHeader>Response</SubtleHeader>
+            <ReactCodeMirror
+              value={JSON.stringify(webhookResponseData, null, 2)}
+              height="100%"
+              readOnly
+              editable={false}
+              extensions={[
+                codeMirrorJson(),
+                linter(jsonParseLinter()),
+                EditorView.lineWrapping,
+                EditorView.editable.of(false),
+                EditorView.theme({
+                  "&": { fontFamily: theme.typography.fontFamily },
+                }),
+                lintGutter(),
+              ]}
+            />
+          </Stack>
+        );
       }
       testModalContents = (
         <>
@@ -1003,44 +926,54 @@ export default function TemplateEditor({
           {responseEl}
         </>
       );
-    } else if (testResponse.type === JsonResultType.Err) {
+    } else if (testResponseData.type === JsonResultType.Err) {
       testModalContents = (
         <Stack spacing={1}>
           <Alert severity="error">
             Failed to send test message. Suggestions:
           </Alert>
-          {testResponse.err.suggestions.map((suggestion, i) => (
+          {testResponseData.err.suggestions.map((suggestion, i) => (
             // eslint-disable-next-line react/no-array-index-key
             <Alert key={i} severity="warning">
               {suggestion}
             </Alert>
           ))}
-          <ReactCodeMirror
-            value={testResponse.err.responseData}
-            height="100%"
-            readOnly
-            editable={false}
-            extensions={[
-              codeMirrorJson(),
-              linter(jsonParseLinter()),
-              EditorView.lineWrapping,
-              EditorView.editable.of(false),
-              EditorView.theme({
-                "&": {
-                  fontFamily: theme.typography.fontFamily,
-                },
-              }),
-              lintGutter(),
-            ]}
-          />
+          {testResponseData.err.responseData && (
+            <ReactCodeMirror
+              value={testResponseData.err.responseData}
+              height="100%"
+              readOnly
+              editable={false}
+              extensions={[
+                codeMirrorJson(),
+                linter(jsonParseLinter()),
+                EditorView.lineWrapping,
+                EditorView.editable.of(false),
+                EditorView.theme({
+                  "&": { fontFamily: theme.typography.fontFamily },
+                }),
+                lintGutter(),
+              ]}
+            />
+          )}
         </Stack>
       );
     }
+  } else if (testTemplateMutation.isError && testTemplateMutation.error) {
+    testModalContents = (
+      <Alert severity="error">
+        API Error: Failed to attempt test message.{" "}
+        {testTemplateMutation.error.message}
+      </Alert>
+    );
   } else {
     let to: string | null = null;
     if (channel === ChannelType.Webhook) {
       if (draftToRender?.type === ChannelType.Webhook) {
-        to = debouncedUserProperties[draftToRender.identifierKey] ?? null;
+        to =
+          (debouncedUserProperties[draftToRender.identifierKey] as
+            | string
+            | null) ?? null;
       }
     } else {
       const identiferKey = CHANNEL_IDENTIFIERS[channel];
@@ -1048,65 +981,74 @@ export default function TemplateEditor({
     }
     let providerAutocomplete: React.ReactNode;
     switch (state.channel) {
-      case ChannelType.Email: {
-        const providerOptions: { id: EmailProviderType; label: string }[] =
-          Object.values(EmailProviderType).map((type) => ({
+      case ChannelType.Email:
+        {
+          const providerOptions: {
+            id: EmailProviderTypeSchema;
+            label: string;
+          }[] = Object.values(EmailProviderType).map((type) => ({
             id: type,
             label: emailProviderLabel(type),
           }));
-
-        providerAutocomplete = (
-          <ProviderOverrideSelector<EmailProviderType>
-            value={state.providerOverride}
-            options={providerOptions}
-            onChange={(value) => {
-              setState((draft) => {
-                draft.providerOverride = value;
-              });
-            }}
-          />
-        );
+          providerAutocomplete = (
+            <ProviderOverrideSelector<EmailProviderTypeSchema>
+              value={state.providerOverride}
+              options={providerOptions}
+              onChange={(value) => {
+                setState((draft) => {
+                  if (draft.channel === ChannelType.Email)
+                    draft.providerOverride = value;
+                });
+              }}
+            />
+          );
+        }
         break;
-      }
-      case ChannelType.Sms: {
-        const providerOptions: { id: SmsProviderType; label: string }[] =
-          Object.values(SmsProviderType).map((type) => ({
+      case ChannelType.Sms:
+        {
+          const providerOptions: { id: SmsProviderType; label: string }[] =
+            Object.values(SmsProviderType).map((type) => ({
+              id: type,
+              label: type,
+            }));
+
+          providerAutocomplete = (
+            <ProviderOverrideSelector<SmsProviderType>
+              value={state.providerOverride}
+              options={providerOptions}
+              onChange={(value) => {
+                setState((draft) => {
+                  if (draft.channel === ChannelType.Sms)
+                    draft.providerOverride = value;
+                });
+              }}
+            />
+          );
+        }
+        break;
+      case ChannelType.MobilePush:
+        {
+          const providerOptions: {
+            id: MobilePushProviderType;
+            label: string;
+          }[] = Object.values(MobilePushProviderType).map((type) => ({
             id: type,
             label: type,
           }));
-
-        providerAutocomplete = (
-          <ProviderOverrideSelector<SmsProviderType>
-            value={state.providerOverride}
-            options={providerOptions}
-            onChange={(value) => {
-              setState((draft) => {
-                draft.providerOverride = value;
-              });
-            }}
-          />
-        );
+          providerAutocomplete = (
+            <ProviderOverrideSelector<MobilePushProviderType>
+              value={state.providerOverride}
+              options={providerOptions}
+              onChange={(value) => {
+                setState((draft) => {
+                  if (draft.channel === ChannelType.MobilePush)
+                    draft.providerOverride = value;
+                });
+              }}
+            />
+          );
+        }
         break;
-      }
-      case ChannelType.MobilePush: {
-        const providerOptions: { id: MobilePushProviderType; label: string }[] =
-          Object.values(MobilePushProviderType).map((type) => ({
-            id: type,
-            label: type,
-          }));
-        providerAutocomplete = (
-          <ProviderOverrideSelector<MobilePushProviderType>
-            value={state.providerOverride}
-            options={providerOptions}
-            onChange={(value) => {
-              setState((draft) => {
-                draft.providerOverride = value;
-              });
-            }}
-          />
-        );
-        break;
-      }
       case ChannelType.Webhook:
         providerAutocomplete = null;
         break;
@@ -1284,10 +1226,7 @@ export default function TemplateEditor({
               : "Minimize user properties pane"
           }
         >
-          <IconButton
-            onClick={() => handleUserPropertiesToggle()}
-            disabled={disabled}
-          >
+          <IconButton onClick={() => handleUserPropertiesToggle()}>
             {!isUserPropertiesMinimised && (
               <KeyboardDoubleArrowLeftOutlined
                 sx={{
@@ -1325,12 +1264,40 @@ export default function TemplateEditor({
       <LoadingModal
         isMinimised={isUserPropertiesMinimised}
         openTitle="Send Test Message"
-        onSubmit={submitTest}
-        onClose={() =>
-          setState((draft) => {
-            draft.testResponse = null;
-          })
-        }
+        loading={testTemplateMutation.isPending}
+        onSubmit={() => {
+          testTemplateMutation.mutate(submitTestDataVariables, {
+            onSuccess: (data) => {
+              if (data.type === JsonResultType.Ok) {
+                if (data.value.type === InternalEventType.MessageSent) {
+                  enqueueSnackbar(
+                    `Test message sent successfully to ${data.value.variant.to}.`,
+                    { variant: "success", anchorOrigin },
+                  );
+                } else {
+                  enqueueSnackbar(
+                    "Test message processed (e.g., skipped). See modal for details.",
+                    { variant: "info", anchorOrigin },
+                  );
+                }
+              } else {
+                enqueueSnackbar(
+                  "Failed to send test message. See modal for details.",
+                  { variant: "error", anchorOrigin },
+                );
+              }
+            },
+            onError: (error) => {
+              enqueueSnackbar(`API Error sending test: ${error.message}`, {
+                variant: "error",
+                anchorOrigin,
+              });
+            },
+          });
+        }}
+        onClose={() => {
+          testTemplateMutation.reset();
+        }}
       >
         {testModalContents}
       </LoadingModal>
@@ -1382,6 +1349,7 @@ export default function TemplateEditor({
       )}
     </Stack>
   );
+
   return (
     <>
       <Stack

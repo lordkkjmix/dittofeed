@@ -1,10 +1,4 @@
-import {
-  IntegrationCreateDefinition,
-  IntegrationType,
-  SegmentDefinition,
-  SegmentNodeType,
-  SegmentOperatorType,
-} from "./types";
+import { IntegrationCreateDefinition, IntegrationType } from "./types";
 
 export const HUBSPOT_OAUTH_TOKEN = "hubspot" as const;
 export const HUBSPOT_INTEGRATION = "hubspot" as const;
@@ -18,28 +12,6 @@ export const HUBSPOT_INTEGRATION_DEFINITION: IntegrationCreateDefinition = {
     subscribedUserProperties: [EMAIL_EVENTS_UP_NAME],
     subscribedSegments: [],
   },
-};
-
-const ENTRY_ID = "entry";
-const INIT_TRAIT_ID = "initTraitId";
-
-export const DEFAULT_SEGMENT_DEFINITION: SegmentDefinition = {
-  entryNode: {
-    type: SegmentNodeType.And,
-    children: [INIT_TRAIT_ID],
-    id: ENTRY_ID,
-  },
-  nodes: [
-    {
-      type: SegmentNodeType.Trait,
-      id: INIT_TRAIT_ID,
-      path: "",
-      operator: {
-        type: SegmentOperatorType.Equals,
-        value: "",
-      },
-    },
-  ],
 };
 
 export const FEATURE_INCREMENTAL_COMP = "incremental-comp" as const;
@@ -56,3 +28,7 @@ export const MESSAGE_METADATA_FIELDS = [
   "templateId",
   "nodeId",
 ] as const;
+
+export const WORKSPACE_OCCUPANT_SETTINGS_NAMES = {
+  GmailTokens: "GmailTokens",
+} as const;

@@ -447,7 +447,7 @@ describe("broadcastWorkflowV2", () => {
                 variant: {
                   type: ChannelType.Email,
                   provider: {
-                    type: EmailProviderType.Sendgrid,
+                    type: EmailProviderType.SendGrid,
                     status: 403,
                     body: "missing permissions",
                   },
@@ -533,7 +533,6 @@ describe("broadcastWorkflowV2", () => {
           workspaceId: workspace.id,
           broadcastId: broadcast.id,
         });
-        // FIXME
         expect(updatedBroadcast?.status).toBe("Paused");
 
         shouldError = false;

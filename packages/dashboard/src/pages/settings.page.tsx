@@ -701,14 +701,14 @@ function SendGridConfig() {
                   id: "sendgrid-api-key",
                   type: "secret",
                   fieldProps: {
-                    name: SecretNames.Sendgrid,
+                    name: SecretNames.SendGrid,
                     secretKey: "apiKey",
                     label: "Sendgrid API Key",
                     helperText:
                       "API key, used internally to send emails via sendgrid.",
-                    type: EmailProviderType.Sendgrid,
+                    type: EmailProviderType.SendGrid,
                     saved: isSecretSaved(
-                      SecretNames.Sendgrid,
+                      SecretNames.SendGrid,
                       "apiKey",
                       secretAvailability,
                     ),
@@ -718,14 +718,14 @@ function SendGridConfig() {
                   id: "sendgrid-webhook-key",
                   type: "secret",
                   fieldProps: {
-                    name: SecretNames.Sendgrid,
+                    name: SecretNames.SendGrid,
                     secretKey: "webhookKey",
                     label: "Webhook Key",
                     helperText:
                       "Sendgrid webhook verification key, used to authenticate sendgrid webhook requests.",
-                    type: EmailProviderType.Sendgrid,
+                    type: EmailProviderType.SendGrid,
                     saved: isSecretSaved(
-                      SecretNames.Sendgrid,
+                      SecretNames.SendGrid,
                       "webhookKey",
                       secretAvailability,
                     ),
@@ -1383,6 +1383,40 @@ function Twilios() {
                     saved: isSecretSaved(
                       SecretNames.Twilio,
                       "authToken",
+                      secretAvailability,
+                    ),
+                  },
+                },
+                {
+                  id: "twilio-api-key-sid",
+                  type: "secret",
+                  fieldProps: {
+                    name: SecretNames.Twilio,
+                    secretKey: "apiKeySid",
+                    label: "Twilio API Key SID",
+                    helperText:
+                      "Twilio API Key SID used to authenticate requests. Used with the API key secret to authenticate requests as an alternative to the auth token.",
+                    type: SmsProviderType.Twilio,
+                    saved: isSecretSaved(
+                      SecretNames.Twilio,
+                      "apiKeySid",
+                      secretAvailability,
+                    ),
+                  },
+                },
+                {
+                  id: "twilio-api-key-secret",
+                  type: "secret",
+                  fieldProps: {
+                    name: SecretNames.Twilio,
+                    secretKey: "apiKeySecret",
+                    label: "Twilio API Key Secret",
+                    helperText:
+                      "Twilio API Key Secret used to authenticate requests. Used with the API key SID to authenticate requests as an alternative to the auth token.",
+                    type: SmsProviderType.Twilio,
+                    saved: isSecretSaved(
+                      SecretNames.Twilio,
+                      "apiKeySecret",
                       secretAvailability,
                     ),
                   },

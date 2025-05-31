@@ -1,135 +1,30 @@
-import { DownloadForOffline } from "@mui/icons-material";
-import { LoadingButton } from "@mui/lab";
-import { Tooltip } from "@mui/material";
-import { getPeriodsByComputedPropertyId } from "backend-lib/src/computedProperties/periods";
-import * as schema from "backend-lib/src/db/schema";
-import { findManyJourneyResourcesUnsafe } from "backend-lib/src/journeys";
-import { findManyPartialSegments } from "backend-lib/src/segments";
-import { and, eq } from "drizzle-orm";
-import {
-  CompletionStatus,
-  ComputedPropertyStepEnum,
-} from "isomorphic-lib/src/types";
+import { useTheme } from "@mui/material";
 import { GetServerSideProps } from "next";
-import { pick } from "remeda";
+import React from "react";
 
 import DashboardContent from "../../components/dashboardContent";
-import { ResourceListContainer } from "../../components/resourceList";
-import SegmentsTable from "../../components/segmentsTable";
+import { SegmentsTable } from "../../components/segments/segmentsTable";
 import { addInitialStateToProps } from "../../lib/addInitialStateToProps";
-import { downloadFileFactory } from "../../lib/apiRequestHandlerFactory";
-import { useAppStore } from "../../lib/appStore";
 import { requestContext } from "../../lib/requestContext";
-import { AppState, PropsWithInitialState } from "../../lib/types";
+import { PropsWithInitialState } from "../../lib/types";
 
-export const getServerSideProps: GetServerSideProps<PropsWithInitialState> =
+type SegmentsProps = PropsWithInitialState;
+
+export const getServerSideProps: GetServerSideProps<SegmentsProps> =
   requestContext(async (_ctx, dfContext) => {
-    const workspaceId = dfContext.workspace.id;
-    const [segmentResources, journeyResources] = await Promise.all([
-      findManyPartialSegments({ workspaceId }),
-      findManyJourneyResourcesUnsafe(
-        and(
-          eq(schema.journey.workspaceId, workspaceId),
-          eq(schema.journey.resourceType, "Declarative"),
-        ),
-      ),
-    ]);
-    const computedPropertyPeriods = await getPeriodsByComputedPropertyId({
-      workspaceId,
-      step: ComputedPropertyStepEnum.ProcessAssignments,
-    });
-
-    const segments: AppState["segments"] = {
-      type: CompletionStatus.Successful,
-      value: segmentResources.map((segment) => ({
-        ...segment,
-        lastRecomputed: computedPropertyPeriods
-          .get({
-            computedPropertyId: segment.id,
-            version: segment.definitionUpdatedAt.toString(),
-          })
-          ?.maxTo.getTime(),
-      })),
-    };
-    const journeys: AppState["journeys"] = {
-      type: CompletionStatus.Successful,
-      value: journeyResources,
-    };
     return {
       props: addInitialStateToProps({
         props: {},
         dfContext,
-        serverInitialState: {
-          segments,
-          journeys,
-        },
       }),
     };
   });
 
 export default function SegmentList() {
-  const {
-    segmentDownloadRequest,
-    setSegmentDownloadRequest,
-    workspace: workspaceRequest,
-    apiBase,
-  } = useAppStore((store) =>
-    pick(store, [
-      "segments",
-      "segmentDownloadRequest",
-      "setSegmentDownloadRequest",
-      "apiBase",
-      "workspace",
-    ]),
-  );
-
-  const workspace =
-    workspaceRequest.type === CompletionStatus.Successful
-      ? workspaceRequest.value
-      : null;
-
-  if (!workspace) {
-    console.error("No workspace found");
-    return null;
-  }
-
-  const handleDownload = downloadFileFactory({
-    request: segmentDownloadRequest,
-    setRequest: setSegmentDownloadRequest,
-    onSuccessNotice: `Downloaded user segment assignments.`,
-    onFailureNoticeHandler: () =>
-      `API Error: Failed to download user segment assignments.`,
-    requestConfig: {
-      method: "GET",
-      url: `${apiBase}/api/segments/download`,
-      params: {
-        workspaceId: workspace.id,
-      },
-    },
-  });
-
-  const controls = (
-    <Tooltip title="download user segments" placement="right" arrow>
-      <LoadingButton
-        loading={segmentDownloadRequest.type === CompletionStatus.InProgress}
-        variant="outlined"
-        startIcon={<DownloadForOffline />}
-        onClick={handleDownload}
-      >
-        Download User Segments
-      </LoadingButton>
-    </Tooltip>
-  );
+  const theme = useTheme();
   return (
     <DashboardContent>
-      <ResourceListContainer
-        title="Segments"
-        titleSingular="Segment"
-        newItemHref={(newItemId) => `/segments/${newItemId}`}
-        controls={controls}
-      >
-        <SegmentsTable />
-      </ResourceListContainer>
+      <SegmentsTable sx={{ padding: theme.spacing(3) }} />
     </DashboardContent>
   );
 }

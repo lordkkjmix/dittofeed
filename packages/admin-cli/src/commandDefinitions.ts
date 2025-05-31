@@ -2,6 +2,10 @@ import { Type } from "@sinclair/typebox";
 import { createAdminApiKey } from "backend-lib/src/adminApiKeys";
 import { computeState } from "backend-lib/src/computedProperties/computePropertiesIncremental";
 import {
+  COMPUTE_PROPERTIES_QUEUE_WORKFLOW_ID,
+  getQueueStateQuery,
+} from "backend-lib/src/computedProperties/computePropertiesQueueWorkflow";
+import {
   resetComputePropertiesWorkflow,
   resetGlobalCron,
   startComputePropertiesWorkflow,
@@ -21,6 +25,7 @@ import logger from "backend-lib/src/logger";
 import { publicDrizzleMigrate } from "backend-lib/src/migrate";
 import { onboardUser } from "backend-lib/src/onboarding";
 import { findManySegmentResourcesSafe } from "backend-lib/src/segments";
+import connectWorkflowClient from "backend-lib/src/temporal/connectWorkflowClient";
 import { transferResources } from "backend-lib/src/transferResources";
 import { NodeEnvEnum, Workspace } from "backend-lib/src/types";
 import { findAllUserPropertyResources } from "backend-lib/src/userProperties";
@@ -248,9 +253,11 @@ export function createCommands(yargs: Argv): Argv {
           workspaces.map(async (workspace) => {
             const isGlobal = workspace.features.some(
               (f) =>
+                // defaults to true
+                backendConfig().useGlobalComputedProperties !== false ||
                 // eslint-disable-next-line @typescript-eslint/no-unsafe-enum-comparison
-                f.name === FeatureNamesEnum.ComputePropertiesGlobal &&
-                f.enabled,
+                (f.name === FeatureNamesEnum.ComputePropertiesGlobal &&
+                  f.enabled),
             );
             if (
               workspace.status !== WorkspaceStatusDbEnum.Active ||
@@ -365,20 +372,20 @@ export function createCommands(yargs: Argv): Argv {
               const webhookSecret = await pTx.query.secret.findFirst({
                 where: and(
                   eq(schema.secret.workspaceId, emailProvider.workspaceId),
-                  eq(schema.secret.name, SecretNames.Sendgrid),
+                  eq(schema.secret.name, SecretNames.SendGrid),
                 ),
               });
               const sendgridSecretDefinition: SendgridSecret = {
                 apiKey: emailProvider.apiKey ?? undefined,
                 webhookKey: webhookSecret?.value ?? undefined,
-                type: EmailProviderType.Sendgrid,
+                type: EmailProviderType.SendGrid,
               };
               const [secret] = await pTx
                 .insert(schema.secret)
                 .values({
                   id: randomUUID(),
                   workspaceId: emailProvider.workspaceId,
-                  name: SecretNames.Sendgrid,
+                  name: SecretNames.SendGrid,
                   configValue: sendgridSecretDefinition,
                   updatedAt: new Date(),
                   createdAt: new Date(),
@@ -972,6 +979,37 @@ export function createCommands(yargs: Argv): Argv {
         } catch (error) {
           logger().error({ error }, "Failed to delete workspace.");
         }
+      },
+    )
+    .command(
+      "get-queue-state",
+      "Retrieves the current state of the compute properties queue workflow.",
+      (cmd) => cmd, // No specific options needed for now
+      async () => {
+        logger().info("Getting compute properties queue state");
+        const client = await connectWorkflowClient();
+
+        logger().info(
+          {
+            workflowId: COMPUTE_PROPERTIES_QUEUE_WORKFLOW_ID,
+          },
+          "Querying workflow",
+        );
+
+        const handle = client.getHandle(COMPUTE_PROPERTIES_QUEUE_WORKFLOW_ID);
+        const state = await handle.query(getQueueStateQuery);
+
+        logger().info(
+          {
+            queueSize: state.priorityQueue.length,
+            membershipSize: state.membership.length,
+            inFlightCount: state.inFlightTaskIds.length,
+            totalProcessed: state.totalProcessed,
+            inFlightTaskIdsSample: state.inFlightTaskIds,
+            priorityQueueSample: state.priorityQueue,
+          },
+          "Current compute properties queue state",
+        );
       },
     );
 }

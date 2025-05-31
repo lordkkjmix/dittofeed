@@ -20,6 +20,7 @@ import {
   subscriptionGroup as dbSubscriptionGroup,
   userProperty as dbUserProperty,
   userPropertyAssignment as dbUserPropertyAssignment,
+  workspace as dbWorkspace,
 } from "./db/schema";
 import logger from "./logger";
 import { deserializeCursor, serializeCursor } from "./pagination";
@@ -31,6 +32,7 @@ import {
   GetUsersRequest,
   GetUsersResponse,
   GetUsersResponseItem,
+  Segment,
   SubscriptionGroupType,
   UserProperty,
   UserPropertyDefinition,
@@ -69,6 +71,13 @@ export async function getUsers(
     allowInternalUserProperty?: boolean;
   } = {},
 ): Promise<Result<GetUsersResponse, Error>> {
+  const childWorkspaceIds = (
+    await db()
+      .select({ id: dbWorkspace.id })
+      .from(dbWorkspace)
+      .where(eq(dbWorkspace.parentWorkspaceId, workspaceId))
+  ).map((o) => o.id);
+
   // TODO implement alternate sorting
   let cursor: Cursor | null = null;
   if (unparsedCursor) {
@@ -88,23 +97,14 @@ export async function getUsers(
   const qb = new ClickHouseQueryBuilder();
   const cursorClause = cursor
     ? `and user_id ${
-        direction === CursorDirectionEnum.After ? ">" : "<"
+        direction === CursorDirectionEnum.After ? ">" : "<="
       } ${qb.addQueryValue(cursor[CursorKey.UserIdKey], "String")}`
     : "";
 
-  const userPropertyWhereClause = userPropertyFilter
-    ? `AND computed_property_id IN ${qb.addQueryValue(
-        userPropertyFilter.map((property) => property.id),
-        "Array(String)",
-      )}`
-    : "";
-  const segmentWhereClause = segmentFilter
-    ? `AND computed_property_id IN ${qb.addQueryValue(
-        segmentFilter,
-        "Array(String)",
-      )}`
-    : "";
-
+  const computedPropertyIds = [
+    ...(userPropertyFilter?.map((property) => property.id) ?? []),
+    ...(segmentFilter ?? []),
+  ];
   const selectUserIdColumns = ["user_id"];
 
   const havingSubClauses: string[] = [];
@@ -122,7 +122,7 @@ export async function getUsers(
     selectUserIdColumns.push(
       `argMax(if(computed_property_id = ${qb.addQueryValue(segment, "String")}, segment_value, null), assigned_at) as ${varName}`,
     );
-    havingSubClauses.push(`${varName} = True`);
+    havingSubClauses.push(`${varName} == True`);
   }
   if (subscriptionGroupFilter) {
     const subscriptionGroupsRows = await db()
@@ -167,12 +167,15 @@ export async function getUsers(
         continue;
       }
       const { type, segmentId } = sg;
+
+      computedPropertyIds.push(segmentId);
+
       const varName = qb.getVariableName();
       selectUserIdColumns.push(
         `argMax(if(computed_property_id = ${qb.addQueryValue(segmentId, "String")}, segment_value, null), assigned_at) as ${varName}`,
       );
       if (type === SubscriptionGroupType.OptOut) {
-        havingSubClauses.push(`${varName} == True OR ${varName} IS NULL`);
+        havingSubClauses.push(`(${varName} == True OR ${varName} IS NULL)`);
       } else {
         havingSubClauses.push(`${varName} == True`);
       }
@@ -183,10 +186,15 @@ export async function getUsers(
     havingSubClauses.length > 0
       ? `HAVING ${havingSubClauses.join(" AND ")}`
       : "";
-  const selectUserIdStr = selectUserIdColumns.join(", ");
+  const selectedStr = selectUserIdColumns.join(", ");
   const userIdsClause = userIds
     ? `AND user_id IN (${qb.addQueryValue(userIds, "Array(String)")})`
     : "";
+
+  const workspaceIdClause =
+    childWorkspaceIds.length > 0
+      ? `workspace_id IN (${qb.addQueryValue(childWorkspaceIds, "Array(String)")})`
+      : `workspace_id = ${qb.addQueryValue(workspaceId, "String")}`;
 
   const query = `
     SELECT
@@ -208,21 +216,19 @@ export async function getUsers(
           argMax(segment_value, assigned_at) AS last_segment_value
       FROM computed_property_assignments_v2 cp
       WHERE
-        cp.workspace_id = ${qb.addQueryValue(workspaceId, "String")}
+        ${workspaceIdClause}
         AND cp.user_id IN (SELECT user_id FROM (
           SELECT
-            ${selectUserIdStr}
+            ${selectedStr}
           FROM computed_property_assignments_v2
           WHERE
-            workspace_id = ${qb.addQueryValue(workspaceId, "String")}
+            ${workspaceIdClause}
             ${cursorClause}
-            ${userPropertyWhereClause}
-            ${segmentWhereClause}
             ${userIdsClause}
           GROUP BY workspace_id, user_id
           ${havingClause}
           ORDER BY
-            user_id ASC
+            user_id ${direction === CursorDirectionEnum.After ? "ASC" : "DESC"}
           LIMIT ${limit}
         ))
       GROUP BY cp.user_id, cp.computed_property_id, cp.type
@@ -232,7 +238,9 @@ export async function getUsers(
       assignments.user_id ASC
   `;
   const userPropertyCondition: SQL[] = [
-    eq(dbUserProperty.workspaceId, workspaceId),
+    childWorkspaceIds.length > 0
+      ? inArray(dbUserProperty.workspaceId, childWorkspaceIds)
+      : eq(dbUserProperty.workspaceId, workspaceId),
   ];
   if (!allowInternalUserProperty) {
     userPropertyCondition.push(
@@ -240,12 +248,10 @@ export async function getUsers(
     );
   }
 
-  const segmentCondition: SQL[] = [eq(dbSegment.workspaceId, workspaceId)];
-  if (!allowInternalSegment) {
-    segmentCondition.push(
-      eq(dbSegment.resourceType, DBResourceTypeEnum.Declarative),
-    );
-  }
+  const segmentCondition =
+    childWorkspaceIds.length > 0
+      ? inArray(dbSegment.workspaceId, childWorkspaceIds)
+      : eq(dbSegment.workspaceId, workspaceId);
   const [results, userProperties, segments] = await Promise.all([
     chQuery({
       query,
@@ -259,18 +265,11 @@ export async function getUsers(
       })
       .from(dbUserProperty)
       .where(and(...userPropertyCondition)),
-    db()
-      .select({
-        name: dbSegment.name,
-        id: dbSegment.id,
-        definition: dbSegment.definition,
-      })
-      .from(dbSegment)
-      .where(and(...segmentCondition)),
+    db().select().from(dbSegment).where(segmentCondition),
   ]);
-  const segmentNameById = new Map<string, string>();
+  const segmentNameById = new Map<string, Segment>();
   for (const segment of segments) {
-    segmentNameById.set(segment.id, segment.name);
+    segmentNameById.set(segment.id, segment);
   }
   const userPropertyById = new Map<
     string,
@@ -309,8 +308,8 @@ export async function getUsers(
   const users: GetUsersResponseItem[] = rows.map((row) => {
     const userSegments: GetUsersResponseItem["segments"] = row.segments.flatMap(
       ([id, value]) => {
-        const name = segmentNameById.get(id);
-        if (!name || !value) {
+        const segment = segmentNameById.get(id);
+        if (!segment || !value) {
           logger().error(
             {
               id,
@@ -320,9 +319,12 @@ export async function getUsers(
           );
           return [];
         }
+        if (!allowInternalSegment && segment.resourceType === "Internal") {
+          return [];
+        }
         return {
           id,
-          name,
+          name: segment.name,
         };
       },
     );
@@ -418,27 +420,27 @@ export async function deleteUsers({
   const queries = [
     // Delete from user_events_v2
     `DELETE FROM user_events_v2 WHERE workspace_id = ${workspaceIdParam}
-     AND user_id IN (${userIdsParam});`,
+     AND user_id IN (${userIdsParam}) settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
 
     // Delete from computed_property_state_v2
     `DELETE FROM computed_property_state_v2 WHERE workspace_id = ${workspaceIdParam}
-     AND user_id IN (${userIdsParam});`,
+     AND user_id IN (${userIdsParam}) settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
 
     // Delete from computed_property_assignments_v2
     `DELETE FROM computed_property_assignments_v2 WHERE workspace_id = ${workspaceIdParam}
-     AND user_id IN (${userIdsParam});`,
+     AND user_id IN (${userIdsParam}) settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
 
     // Delete from processed_computed_properties_v2
     `DELETE FROM processed_computed_properties_v2 WHERE workspace_id = ${workspaceIdParam}
-     AND user_id IN (${userIdsParam});`,
+     AND user_id IN (${userIdsParam}) settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
 
     // Delete from computed_property_state_index
     `DELETE FROM computed_property_state_index WHERE workspace_id = ${workspaceIdParam}
-     AND user_id IN (${userIdsParam});`,
+     AND user_id IN (${userIdsParam}) settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
 
     // Delete from resolved_segment_state
     `DELETE FROM resolved_segment_state WHERE workspace_id = ${workspaceIdParam}
-     AND user_id IN (${userIdsParam});`,
+     AND user_id IN (${userIdsParam}) settings mutations_sync = 0, lightweight_deletes_sync = 0;`,
   ];
 
   await Promise.all([
@@ -447,11 +449,6 @@ export async function deleteUsers({
       chCommand({
         query,
         query_params: qb.getQueries(),
-        clickhouse_settings: {
-          wait_end_of_query: 1,
-          allow_experimental_lightweight_delete: 1,
-          mutations_sync: "1",
-        },
       }),
     ),
     // Delete from postgres tables
@@ -483,20 +480,19 @@ export async function getUsersCount({
 }: Omit<GetUsersRequest, "cursor" | "direction" | "limit">): Promise<
   Result<GetUsersCountResponse, Error>
 > {
+  const childWorkspaceIds = (
+    await db()
+      .select({ id: dbWorkspace.id })
+      .from(dbWorkspace)
+      .where(eq(dbWorkspace.parentWorkspaceId, workspaceId))
+  ).map((o) => o.id);
+
   const qb = new ClickHouseQueryBuilder();
 
-  const userPropertyWhereClause = userPropertyFilter
-    ? `AND computed_property_id IN ${qb.addQueryValue(
-        userPropertyFilter.map((property) => property.id),
-        "Array(String)",
-      )}`
-    : "";
-  const segmentWhereClause = segmentFilter
-    ? `AND computed_property_id IN ${qb.addQueryValue(
-        segmentFilter,
-        "Array(String)",
-      )}`
-    : "";
+  const computedPropertyIds = [
+    ...(userPropertyFilter?.map((property) => property.id) ?? []),
+    ...(segmentFilter ?? []),
+  ];
 
   const selectUserIdColumns = ["user_id"];
 
@@ -562,11 +558,12 @@ export async function getUsersCount({
       }
       const { type, segmentId } = sg;
       const varName = qb.getVariableName();
+      computedPropertyIds.push(segmentId);
       selectUserIdColumns.push(
         `argMax(if(computed_property_id = ${qb.addQueryValue(segmentId, "String")}, segment_value, null), assigned_at) as ${varName}`,
       );
       if (type === SubscriptionGroupType.OptOut) {
-        havingSubClauses.push(`${varName} == True OR ${varName} IS NULL`);
+        havingSubClauses.push(`(${varName} == True OR ${varName} IS NULL)`);
       } else {
         havingSubClauses.push(`${varName} == True`);
       }
@@ -581,6 +578,11 @@ export async function getUsersCount({
     ? `AND user_id IN (${qb.addQueryValue(userIds, "Array(String)")})`
     : "";
 
+  const workspaceIdClause =
+    childWorkspaceIds.length > 0
+      ? `workspace_id IN (${qb.addQueryValue(childWorkspaceIds, "Array(String)")})`
+      : `workspace_id = ${qb.addQueryValue(workspaceId, "String")}`;
+
   // Using a similar nested query approach as getUsers
   const query = `
     SELECT
@@ -590,9 +592,7 @@ export async function getUsersCount({
         ${selectUserIdStr}
       FROM computed_property_assignments_v2
       WHERE
-        workspace_id = ${qb.addQueryValue(workspaceId, "String")}
-        ${userPropertyWhereClause}
-        ${segmentWhereClause}
+        ${workspaceIdClause}
         ${userIdsClause}
       GROUP BY workspace_id, user_id
       ${havingClause}
@@ -607,7 +607,7 @@ export async function getUsersCount({
   const rows = await results.json<{ user_count: number }>();
 
   // If no rows returned, count is 0
-  const userCount = rows.length > 0 ? Number(rows[0]?.user_count || 0) : 0;
+  const userCount = rows.length > 0 ? Number(rows[0]?.user_count ?? 0) : 0;
 
   return ok({
     userCount,

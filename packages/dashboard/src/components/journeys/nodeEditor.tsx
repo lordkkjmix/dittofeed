@@ -27,7 +27,6 @@ import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import {
   AllowedDayIndices,
   ChannelType,
-  CompletionStatus,
   CursorDirectionEnum,
   DelayVariantType,
   EntryNode,
@@ -45,7 +44,7 @@ import {
 } from "isomorphic-lib/src/types";
 import { ReactNode, useMemo } from "react";
 
-import { useAppStore, useAppStorePick } from "../../lib/appStore";
+import { useAppStorePick } from "../../lib/appStore";
 import {
   AdditionalJourneyNodeType,
   DelayUiNodeProps,
@@ -55,13 +54,19 @@ import {
   SegmentSplitUiNodeProps,
   WaitForUiNodeProps,
 } from "../../lib/types";
-import useLoadProperties from "../../lib/useLoadProperties";
+import { useMessageTemplatesQuery } from "../../lib/useMessageTemplatesQuery";
 import { useSegmentsQuery } from "../../lib/useSegmentsQuery";
+import { useSubscriptionGroupsQuery } from "../../lib/useSubscriptionGroupsQuery";
+import { useUserPropertiesQuery } from "../../lib/useUserPropertiesQuery";
 import ChannelProviderAutocomplete from "../channelProviderAutocomplete";
 import DurationSelect from "../durationSelect";
+import {
+  EventNamesAutocomplete,
+  PropertiesAutocomplete,
+} from "../eventsAutocomplete";
 import { SubtleHeader } from "../headers";
 import InfoTooltip from "../infoTooltip";
-import SubscriptionGroupAutocomplete from "../subscriptionGroupAutocomplete";
+import { SubscriptionGroupAutocompleteV2 } from "../subscriptionGroupAutocomplete";
 import findJourneyNode from "./findJourneyNode";
 import journeyNodeLabel from "./journeyNodeLabel";
 import { waitForTimeoutLabel } from "./store";
@@ -82,11 +87,10 @@ function SegmentSplitNodeFields({
   nodeProps: SegmentSplitUiNodeProps;
   disabled?: boolean;
 }) {
-  const updateJourneyNodeData = useAppStore(
-    (state) => state.updateJourneyNodeData,
-  );
-
-  const segments = useAppStore((state) => state.segments);
+  const { updateJourneyNodeData } = useAppStorePick(["updateJourneyNodeData"]);
+  const { data: segmentsData } = useSegmentsQuery({
+    resourceType: "Declarative",
+  });
 
   const onSegmentChangeHandler = (
     _event: unknown,
@@ -100,17 +104,17 @@ function SegmentSplitNodeFields({
     });
   };
 
-  if (segments.type !== CompletionStatus.Successful) {
+  if (!segmentsData) {
     return null;
   }
 
   const segment =
-    segments.value.find((t) => t.id === nodeProps.segmentId) ?? null;
+    segmentsData.segments.find((t) => t.id === nodeProps.segmentId) ?? null;
 
   return (
     <Autocomplete
       value={segment}
-      options={segments.value}
+      options={segmentsData.segments}
       getOptionLabel={getLabel}
       onChange={onSegmentChangeHandler}
       disabled={disabled}
@@ -130,10 +134,7 @@ function EntryNodeFields({
   nodeProps: EntryUiNodeProps;
   disabled?: boolean;
 }) {
-  const { updateJourneyNodeData, properties } = useAppStorePick([
-    "updateJourneyNodeData",
-    "properties",
-  ]);
+  const { updateJourneyNodeData } = useAppStorePick(["updateJourneyNodeData"]);
   const { data: segmentsData } = useSegmentsQuery({
     resourceType: "Declarative",
   });
@@ -213,15 +214,11 @@ function EntryNodeFields({
     case JourneyNodeType.EventEntryNode:
       variant = (
         <>
-          <Autocomplete
-            value={nodeVariant.event ?? ""}
-            options={Object.keys(properties)}
-            freeSolo
+          <EventNamesAutocomplete
+            event={nodeVariant.event ?? ""}
             disabled={disabled}
-            onInputChange={(_event, newEventName) => {
-              if (newEventName === null) {
-                return;
-              }
+            label="Event Trigger Name"
+            onEventChange={(newEventName) => {
               updateJourneyNodeData(nodeId, (node) => {
                 const props = node.data.nodeTypeProps;
                 if (
@@ -232,24 +229,14 @@ function EntryNodeFields({
                 }
               });
             }}
-            renderInput={(params) => (
-              <TextField
-                label="Event Trigger Name"
-                {...params}
-                variant="outlined"
-              />
-            )}
           />
 
-          <Autocomplete
-            value={nodeVariant.key ?? ""}
-            options={properties[nodeVariant.event ?? ""] ?? []}
-            freeSolo
+          <PropertiesAutocomplete
+            event={nodeVariant.event ?? ""}
+            property={nodeVariant.key ?? ""}
             disabled={disabled}
-            onInputChange={(_event, newPropertyPath) => {
-              if (newPropertyPath === null) {
-                return;
-              }
+            label="Key"
+            onPropertyChange={(newPropertyPath) => {
               updateJourneyNodeData(nodeId, (node) => {
                 const props = node.data.nodeTypeProps;
                 if (
@@ -260,9 +247,6 @@ function EntryNodeFields({
                 }
               });
             }}
-            renderInput={(params) => (
-              <TextField label="Key" {...params} variant="outlined" />
-            )}
           />
         </>
       );
@@ -328,17 +312,14 @@ function MessageNodeFields({
   nodeProps: MessageUiNodeProps;
   disabled?: boolean;
 }) {
-  const {
-    enableMobilePush,
-    updateJourneyNodeData,
-    messages,
-    subscriptionGroups,
-  } = useAppStorePick([
-    "messages",
+  const { enableMobilePush, updateJourneyNodeData } = useAppStorePick([
     "enableMobilePush",
     "updateJourneyNodeData",
-    "subscriptionGroups",
   ]);
+  const { data: subscriptionGroups } = useSubscriptionGroupsQuery();
+  const { data: messageTemplates } = useMessageTemplatesQuery({
+    resourceType: "Declarative",
+  });
 
   const onNameChangeHandler: React.ChangeEventHandler<
     HTMLTextAreaElement | HTMLInputElement
@@ -366,10 +347,9 @@ function MessageNodeFields({
     });
   };
 
-  const templates =
-    messages.type === CompletionStatus.Successful
-      ? messages.value.filter((t) => t.type === nodeProps.channel)
-      : [];
+  const templates = messageTemplates
+    ? messageTemplates.filter((t) => t.type === nodeProps.channel)
+    : [];
 
   const template = templates.find((t) => t.id === nodeProps.templateId) ?? null;
 
@@ -382,7 +362,7 @@ function MessageNodeFields({
         const channel = e.target.value as ChannelType;
         const defaultSubscriptionGroup = getDefaultSubscriptionGroup({
           channel,
-          subscriptionGroups,
+          subscriptionGroups: subscriptionGroups ?? [],
         });
 
         props.channel = channel;
@@ -564,7 +544,7 @@ function MessageNodeFields({
           </MenuItem>
         </Select>
       </FormControl>
-      <SubscriptionGroupAutocomplete
+      <SubscriptionGroupAutocompleteV2
         subscriptionGroupId={nodeProps.subscriptionGroupId}
         channel={nodeProps.channel}
         disabled={disabled}
@@ -621,6 +601,28 @@ function MessageNodeFields({
       ) : null}
       {providerOverrideEl}
       {providerOverrideConfigEl}
+      <Stack direction="row" spacing={1}>
+        <InfoTooltip title="When enabled, message failures won't cause the journey to exit. The user will continue to the next step even if the message fails to send." />
+        <FormControlLabel
+          control={
+            <Checkbox
+              checked={nodeProps.skipOnFailure ?? false}
+              onChange={(event) => {
+                updateJourneyNodeData(nodeId, (node) => {
+                  const props = node.data.nodeTypeProps;
+                  if (props.type === JourneyNodeType.MessageNode) {
+                    props.skipOnFailure = event.target.checked;
+                  }
+                });
+              }}
+              name="skipOnFailure"
+              color="primary"
+            />
+          }
+          label="Skip on Failure"
+          disabled={disabled}
+        />
+      </Stack>
     </>
   );
 }
@@ -665,8 +667,10 @@ function DelayNodeFields({
   nodeProps: DelayUiNodeProps;
   disabled?: boolean;
 }) {
-  const { updateJourneyNodeData, userProperties: userPropertiesResult } =
-    useAppStorePick(["updateJourneyNodeData", "userProperties"]);
+  const { updateJourneyNodeData } = useAppStorePick(["updateJourneyNodeData"]);
+  const { data: userProperties } = useUserPropertiesQuery({
+    resourceType: "Declarative",
+  });
   let variant: React.ReactElement;
   const nodeVariant = nodeProps.variant;
   switch (nodeVariant.type) {
@@ -774,12 +778,10 @@ function DelayNodeFields({
       break;
     }
     case DelayVariantType.UserProperty: {
-      const userProperties =
-        userPropertiesResult.type === CompletionStatus.Successful
-          ? userPropertiesResult.value
-          : [];
       const userProperty =
-        userProperties.find((p) => p.id === nodeVariant.userProperty) ?? null;
+        userProperties?.userProperties.find(
+          (p) => p.id === nodeVariant.userProperty,
+        ) ?? null;
       const onUserPropertyChangeHandler = (
         _event: unknown,
         up: UserPropertyResource | null,
@@ -800,7 +802,7 @@ function DelayNodeFields({
         <>
           <Autocomplete
             value={userProperty}
-            options={userProperties}
+            options={userProperties?.userProperties ?? []}
             getOptionLabel={getLabel}
             onChange={onUserPropertyChangeHandler}
             renderInput={(params) => (
@@ -1015,8 +1017,10 @@ function NodeLayout({
 }) {
   const theme = useTheme();
 
-  const setSelectedNodeId = useAppStore((state) => state.setSelectedNodeId);
-  const deleteJourneyNode = useAppStore((state) => state.deleteJourneyNode);
+  const { setSelectedNodeId, deleteJourneyNode } = useAppStorePick([
+    "setSelectedNodeId",
+    "deleteJourneyNode",
+  ]);
 
   const handleDelete = () => {
     setSelectedNodeId(null);
@@ -1136,7 +1140,7 @@ function NodeEditorContents({
   disabled?: boolean;
   node: Node<JourneyUiNodeDefinitionProps>;
 }) {
-  const setSelectedNodeId = useAppStore((state) => state.setSelectedNodeId);
+  const { setSelectedNodeId } = useAppStorePick(["setSelectedNodeId"]);
   const closeNodeEditor = () => {
     setSelectedNodeId(null);
   };
@@ -1169,18 +1173,23 @@ function NodeEditorContents({
 export const journeyNodeEditorId = "journey-node-editor";
 
 export default function NodeEditor({ disabled }: { disabled?: boolean }) {
-  useLoadProperties();
-
   const theme = useTheme();
-  const selectedNodeId = useAppStore((state) => state.journeySelectedNodeId);
-  const nodes = useAppStore((state) => state.journeyNodes);
-  const nodesIndex = useAppStore((state) => state.journeyNodesIndex);
+  const { journeySelectedNodeId, journeyNodes, journeyNodesIndex } =
+    useAppStorePick([
+      "journeySelectedNodeId",
+      "journeyNodes",
+      "journeyNodesIndex",
+    ]);
   const selectedNode = useMemo(
     () =>
-      selectedNodeId
-        ? findJourneyNode(selectedNodeId, nodes, nodesIndex)
+      journeySelectedNodeId
+        ? findJourneyNode(
+            journeySelectedNodeId,
+            journeyNodes,
+            journeyNodesIndex,
+          )
         : null,
-    [selectedNodeId, nodes, nodesIndex],
+    [journeySelectedNodeId, journeyNodes, journeyNodesIndex],
   );
   const isOpen = !!selectedNode;
 

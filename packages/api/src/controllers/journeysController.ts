@@ -2,6 +2,7 @@ import { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
 import { db } from "backend-lib/src/db";
 import * as schema from "backend-lib/src/db/schema";
 import {
+  deleteJourney,
   getJourneysStats,
   toJourneyResource,
   upsertJourney,
@@ -11,13 +12,14 @@ import {
   EmptyResponse,
   GetJourneysRequest,
   GetJourneysResponse,
+  GetJourneysResponseItem,
   JourneyStatsRequest,
   JourneyStatsResponse,
   JourneyUpsertValidationError,
   SavedJourneyResource,
   UpsertJourneyResource,
 } from "backend-lib/src/types";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { FastifyInstance } from "fastify";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 
@@ -36,11 +38,54 @@ export default async function journeysController(fastify: FastifyInstance) {
       },
     },
     async (request, reply) => {
-      const journeyModels = await db()
-        .select()
-        .from(schema.journey)
-        .where(eq(schema.journey.workspaceId, request.query.workspaceId));
-      const journeys = journeyModels.map((j) => unwrap(toJourneyResource(j)));
+      let journeys: GetJourneysResponseItem[] = [];
+      const conditions = [
+        eq(schema.journey.workspaceId, request.query.workspaceId),
+      ];
+      if (request.query.ids) {
+        conditions.push(inArray(schema.journey.id, request.query.ids));
+      }
+      if (request.query.resourceType) {
+        conditions.push(
+          eq(schema.journey.resourceType, request.query.resourceType),
+        );
+      }
+
+      if (request.query.getPartial) {
+        const journeyModels = await db()
+          .select({
+            id: schema.journey.id,
+            name: schema.journey.name,
+            status: schema.journey.status,
+            updatedAt: schema.journey.updatedAt,
+            createdAt: schema.journey.createdAt,
+            resourceType: schema.journey.resourceType,
+            statusUpdatedAt: schema.journey.statusUpdatedAt,
+            canRunMultiple: schema.journey.canRunMultiple,
+          })
+          .from(schema.journey)
+          .where(and(...conditions));
+
+        journeys = journeyModels.flatMap((j) => {
+          return [
+            {
+              workspaceId: request.query.workspaceId,
+              id: j.id,
+              name: j.name,
+              status: j.status,
+              updatedAt: j.updatedAt.getTime(),
+              createdAt: j.createdAt.getTime(),
+            },
+          ];
+        });
+      } else {
+        const journeyModels = await db()
+          .select()
+          .from(schema.journey)
+          .where(and(...conditions));
+
+        journeys = journeyModels.map((j) => unwrap(toJourneyResource(j)));
+      }
       return reply.status(200).send({ journeys });
     },
   );
@@ -81,19 +126,31 @@ export default async function journeysController(fastify: FastifyInstance) {
       },
     },
     async (request, reply) => {
-      const { id, workspaceId } = request.body;
+      const result = await deleteJourney(request.body);
+      if (!result) {
+        return reply.status(404).send();
+      }
 
-      const result = await db()
-        .delete(schema.journey)
-        .where(
-          and(
-            eq(schema.journey.id, id),
-            eq(schema.journey.workspaceId, workspaceId),
-          ),
-        )
-        .returning();
+      return reply.status(204).send();
+    },
+  );
 
-      if (result.length === 0) {
+  fastify.withTypeProvider<TypeBoxTypeProvider>().delete(
+    "/v2",
+    {
+      schema: {
+        description: "Delete a journey.",
+        tags: ["Journeys"],
+        querystring: DeleteJourneyRequest,
+        response: {
+          204: EmptyResponse,
+          404: EmptyResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      const result = await deleteJourney(request.query);
+      if (!result) {
         return reply.status(404).send();
       }
 

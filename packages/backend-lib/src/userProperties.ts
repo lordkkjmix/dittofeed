@@ -1,6 +1,6 @@
 import { ValueError } from "@sinclair/typebox/errors";
 import { randomUUID } from "crypto";
-import { and, eq, inArray, SQL } from "drizzle-orm";
+import { and, eq, inArray, or, SQL } from "drizzle-orm";
 import { toJsonPathParam } from "isomorphic-lib/src/jsonPath";
 import protectedUserProperties from "isomorphic-lib/src/protectedUserProperties";
 import { schemaValidate } from "isomorphic-lib/src/resultHandling/schemaValidation";
@@ -101,13 +101,28 @@ export function toSavedUserPropertyResource(
 export async function findAllUserProperties({
   workspaceId,
   requireRunning = false,
+  ids,
+  names,
 }: {
   workspaceId: string;
   requireRunning?: boolean;
+  ids?: string[];
+  names?: string[];
 }): Promise<EnrichedUserProperty[]> {
   const conditions: SQL[] = [eq(dbUserProperty.workspaceId, workspaceId)];
   if (requireRunning) {
     conditions.push(eq(dbUserProperty.status, "Running"));
+  }
+  const identifierConditions: SQL[] = [];
+  if (ids?.length) {
+    identifierConditions.push(inArray(dbUserProperty.id, ids));
+  }
+  if (names?.length) {
+    identifierConditions.push(inArray(dbUserProperty.name, names));
+  }
+  const identifierWhere: SQL | undefined = or(...identifierConditions);
+  if (identifierWhere) {
+    conditions.push(identifierWhere);
   }
   const where = and(...conditions);
   const userProperties = await db().select().from(dbUserProperty).where(where);
@@ -131,13 +146,19 @@ export async function findAllUserProperties({
 export async function findAllUserPropertyResources({
   workspaceId,
   requireRunning,
+  ids,
+  names,
 }: {
   workspaceId: string;
   requireRunning?: boolean;
+  ids?: string[];
+  names?: string[];
 }): Promise<SavedUserPropertyResource[]> {
   const userProperties = await findAllUserProperties({
     workspaceId,
     requireRunning,
+    ids: ids?.length ? ids : undefined,
+    names: names?.length ? names : undefined,
   });
 
   return userProperties.map((up) => ({

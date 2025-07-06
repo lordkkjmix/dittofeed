@@ -1,5 +1,10 @@
 import { SxProps, Theme } from "@mui/material";
 import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
+import {
+  BroadcastConfiguration,
+  BroadcastStepKey,
+  BroadcastStepKeys,
+} from "isomorphic-lib/src/types";
 import { useRouter } from "next/router";
 import { useCallback, useEffect, useMemo } from "react";
 import { useImmer } from "use-immer";
@@ -9,14 +14,14 @@ import {
   BroadcastQueryKeys,
   BroadcastState,
   BroadcastStateUpdater,
-  BroadcastStepKey,
-  BroadcastStepKeys,
   ExposedBroadcastState,
+  useBroadcastSteps,
 } from "./broadcasts/broadcastsShared";
 import Configuration from "./broadcasts/configuration";
 import Content from "./broadcasts/content";
+import Deliveries from "./broadcasts/deliveries";
+import Events from "./broadcasts/events";
 import Recipients from "./broadcasts/recipients";
-import Review from "./broadcasts/review";
 
 function queryParamsToState(
   queryParams: Record<string, string | string[] | undefined>,
@@ -44,10 +49,12 @@ function stateToQueryParams(state: QueryState): Record<string, string> {
 export default function Broadcast({
   queryParams,
   onStateChange,
+  configuration,
   sx,
 }: {
   queryParams: Record<string, string | string[] | undefined>;
   onStateChange?: (state: ExposedBroadcastState) => void;
+  configuration?: Omit<BroadcastConfiguration, "type">;
   sx?: SxProps<Theme>;
 }) {
   const router = useRouter();
@@ -55,13 +62,20 @@ export default function Broadcast({
     () => queryParamsToState(queryParams),
     [queryParams],
   );
+  const steps = useBroadcastSteps(configuration?.stepsAllowList);
 
   const { id } = queryParams;
+  const initialStep = stateFromQueryParams.step ?? steps[0]?.key;
+  if (!initialStep) {
+    throw new Error("Application error: no steps available");
+  }
   const [state, updateState] = useImmer<BroadcastState | null>(
     id && typeof id === "string"
       ? {
           id,
-          step: stateFromQueryParams.step ?? BroadcastStepKeys.RECIPIENTS,
+          step: initialStep,
+          configuration,
+          steps,
         }
       : null,
   );
@@ -146,8 +160,11 @@ export default function Broadcast({
         <Configuration state={state} updateState={updateStateWithoutNull} />
       );
       break;
-    case BroadcastStepKeys.REVIEW:
-      content = <Review state={state} />;
+    case BroadcastStepKeys.DELIVERIES:
+      content = <Deliveries state={state} />;
+      break;
+    case BroadcastStepKeys.EVENTS:
+      content = <Events state={state} />;
       break;
   }
 

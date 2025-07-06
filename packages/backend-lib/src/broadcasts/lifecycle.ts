@@ -46,10 +46,12 @@ export async function startRecomputeBroadcastSegmentWorkflow({
         {
           workspaceId,
           broadcastId,
+          err: e,
         },
         "Recompute broadcast segment workflow already started.",
       );
     }
+    throw e;
   }
 }
 
@@ -91,12 +93,133 @@ export async function startBroadcastWorkflow({
       taskQueue: config().computedPropertiesTaskQueue,
     });
   } catch (e) {
+    if (e instanceof WorkflowExecutionAlreadyStartedError) {
+      logger().info(
+        {
+          workspaceId,
+          broadcastId,
+          err: e,
+        },
+        "Broadcast workflow already started.",
+      );
+      return;
+    }
     logger().error(
       {
         workspaceId,
         broadcastId,
+        err: e,
       },
       "Error starting broadcast workflow",
     );
+    throw e;
+  }
+}
+
+export async function pauseBroadcast({
+  workspaceId,
+  broadcastId,
+}: {
+  workspaceId: string;
+  broadcastId: string;
+}) {
+  const client = await connectWorkflowClient();
+  try {
+    logger().info(
+      {
+        workspaceId,
+        broadcastId,
+      },
+      "Pausing broadcast workflow",
+    );
+    const handle = client.getHandle(
+      generateBroadcastWorkflowV2Id({
+        workspaceId,
+        broadcastId,
+      }),
+    );
+    await handle.signal("PauseBroadcast");
+  } catch (e) {
+    logger().error(
+      {
+        workspaceId,
+        broadcastId,
+        err: e,
+      },
+      "Error pausing broadcast workflow",
+    );
+    throw e;
+  }
+}
+
+export async function resumeBroadcast({
+  workspaceId,
+  broadcastId,
+}: {
+  workspaceId: string;
+  broadcastId: string;
+}) {
+  const client = await connectWorkflowClient();
+  try {
+    logger().info(
+      {
+        workspaceId,
+        broadcastId,
+      },
+      "Resuming broadcast workflow",
+    );
+    const handle = client.getHandle(
+      generateBroadcastWorkflowV2Id({
+        workspaceId,
+        broadcastId,
+      }),
+    );
+    await handle.signal("ResumeBroadcast");
+  } catch (e) {
+    logger().error(
+      {
+        workspaceId,
+        broadcastId,
+        err: e,
+      },
+      "Error resuming broadcast workflow",
+    );
+    throw e;
+  }
+}
+
+export async function cancelBroadcast({
+  workspaceId,
+  broadcastId,
+}: {
+  workspaceId: string;
+  broadcastId: string;
+}) {
+  const client = await connectWorkflowClient();
+  try {
+    logger().info(
+      {
+        workspaceId,
+        broadcastId,
+      },
+      "Cancelling broadcast workflow",
+    );
+    const handle = client.getHandle(
+      generateBroadcastWorkflowV2Id({
+        workspaceId,
+        broadcastId,
+      }),
+    );
+    await handle.signal("CancelBroadcast");
+  } catch (e) {
+    logger().error(
+      {
+        workspaceId,
+        broadcastId,
+        err: e,
+      },
+      "Error cancelling broadcast workflow",
+    );
+    throw e;
   }
 }

@@ -4,9 +4,13 @@ import {
   getBroadcastsV2,
   toBroadcastResource,
   triggerBroadcast,
+  upsertBroadcast,
   upsertBroadcastV2,
 } from "backend-lib/src/broadcasts";
 import {
+  cancelBroadcast,
+  pauseBroadcast,
+  resumeBroadcast,
   startBroadcastWorkflow,
   startRecomputeBroadcastSegmentWorkflow,
 } from "backend-lib/src/broadcasts/lifecycle";
@@ -18,11 +22,16 @@ import {
   BaseMessageResponse,
   BroadcastResource,
   BroadcastResourceV2,
+  CancelBroadcastRequest,
+  ExecuteBroadcastRequest,
+  ExecuteBroadcastResponse,
   GetBroadcastsResponse,
   GetBroadcastsV2Request,
   GetGmailAuthorizationRequest,
   GetGmailAuthorizationResponse,
+  PauseBroadcastRequest,
   RecomputeBroadcastSegmentRequest,
+  ResumeBroadcastRequest,
   StartBroadcastRequest,
   TriggerBroadcastRequest,
   UpdateBroadcastArchiveRequest,
@@ -31,6 +40,7 @@ import {
 } from "backend-lib/src/types";
 import { eq } from "drizzle-orm";
 import { FastifyInstance } from "fastify";
+import { v5 as uuidv5 } from "uuid";
 
 import { getOccupantFromRequest } from "../buildApp/requestContext";
 
@@ -198,6 +208,72 @@ export default async function broadcastsController(fastify: FastifyInstance) {
     },
   );
 
+  fastify.withTypeProvider<TypeBoxTypeProvider>().post(
+    "/pause",
+    {
+      schema: {
+        description: "Pause a broadcast.",
+        tags: ["Broadcasts"],
+        body: PauseBroadcastRequest,
+        response: {
+          200: BaseMessageResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      const { workspaceId, broadcastId } = request.body;
+      await pauseBroadcast({
+        workspaceId,
+        broadcastId,
+      });
+      return reply.status(200).send({ message: "Broadcast paused" });
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().post(
+    "/resume",
+    {
+      schema: {
+        description: "Resume a broadcast.",
+        tags: ["Broadcasts"],
+        body: ResumeBroadcastRequest,
+        response: {
+          200: BaseMessageResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      const { workspaceId, broadcastId } = request.body;
+      await resumeBroadcast({
+        workspaceId,
+        broadcastId,
+      });
+      return reply.status(200).send({ message: "Broadcast resumed" });
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().post(
+    "/cancel",
+    {
+      schema: {
+        description: "Cancel a broadcast.",
+        tags: ["Broadcasts"],
+        body: CancelBroadcastRequest,
+        response: {
+          200: BaseMessageResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      const { workspaceId, broadcastId } = request.body;
+      await cancelBroadcast({
+        workspaceId,
+        broadcastId,
+      });
+      return reply.status(200).send({ message: "Broadcast cancelled" });
+    },
+  );
+
   fastify.withTypeProvider<TypeBoxTypeProvider>().get(
     "/gmail-authorization",
     {
@@ -222,6 +298,44 @@ export default async function broadcastsController(fastify: FastifyInstance) {
         workspaceOccupantId: occupant.workspaceOccupantId,
       });
       return reply.status(200).send({ authorized });
+    },
+  );
+
+  fastify.withTypeProvider<TypeBoxTypeProvider>().post(
+    "/execute",
+    {
+      schema: {
+        description: "Create and trigger a broadcast.",
+        tags: ["Broadcasts"],
+        body: ExecuteBroadcastRequest,
+        response: {
+          200: ExecuteBroadcastResponse,
+        },
+      },
+    },
+    async (request, reply) => {
+      const broadcastId = uuidv5(
+        request.body.broadcastName,
+        request.body.workspaceId,
+      );
+      await upsertBroadcast({
+        broadcastId,
+        workspaceId: request.body.workspaceId,
+        name: request.body.broadcastName,
+        segmentDefinition: request.body.segmentDefinition,
+        messageTemplateDefinition: request.body.messageTemplateDefinition,
+        subscriptionGroupId: request.body.subscriptionGroupId,
+      });
+
+      await triggerBroadcast({
+        broadcastId,
+        workspaceId: request.body.workspaceId,
+      });
+
+      return reply.status(200).send({
+        broadcastId,
+        broadcastName: request.body.broadcastName,
+      });
     },
   );
 }

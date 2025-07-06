@@ -58,6 +58,7 @@ import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import {
   BroadcastResourceAllVersions,
   BroadcastResourceVersionEnum,
+  BroadcastStepKeys,
   ChannelType,
   CompletionStatus,
   DeliveriesAllowedColumn,
@@ -83,10 +84,7 @@ import { useAuthHeaders, useBaseApiUrl } from "../lib/authModeProvider";
 import { toCalendarDate } from "../lib/dates";
 import { useBroadcastsQuery } from "../lib/useBroadcastsQuery";
 import { useResourcesQuery } from "../lib/useResourcesQuery";
-import {
-  BroadcastQueryKeys,
-  BroadcastStepKeys,
-} from "./broadcasts/broadcastsShared";
+import { BroadcastQueryKeys } from "./broadcasts/broadcastsShared";
 import {
   getFilterValues,
   NewDeliveriesFilterButton,
@@ -514,50 +512,68 @@ function renderPreviewCellFactory(setState: SetState) {
   };
 }
 
+export const TimeOptionId = {
+  LastSevenDays: "last-7-days",
+  LastThirtyDays: "last-30-days",
+  LastNinetyDays: "last-90-days",
+  LastHour: "last-hour",
+  Last24Hours: "last-24-hours",
+  Custom: "custom",
+} as const;
+
+export type TimeOptionId = (typeof TimeOptionId)[keyof typeof TimeOptionId];
+
 interface MinuteTimeOption {
   type: "minutes";
-  id: string;
+  id: TimeOptionId;
   minutes: number;
   label: string;
 }
 
 interface CustomTimeOption {
   type: "custom";
-  id: "custom";
+  id: typeof TimeOptionId.Custom;
   label: string;
 }
 
 type TimeOption = MinuteTimeOption | CustomTimeOption;
 
-const defaultTimeOption = {
+const defaultTimeOptionValue = {
   type: "minutes",
-  id: "last-7-days",
+  id: TimeOptionId.LastSevenDays,
   minutes: 7 * 24 * 60,
   label: "Last 7 days",
 } as const;
 
+const defaultTimeOptionId = defaultTimeOptionValue.id;
+
 const timeOptions: TimeOption[] = [
-  { type: "minutes", id: "last-hour", minutes: 60, label: "Last hour" },
   {
     type: "minutes",
-    id: "last-24-hours",
+    id: TimeOptionId.LastHour,
+    minutes: 60,
+    label: "Last hour",
+  },
+  {
+    type: "minutes",
+    id: TimeOptionId.Last24Hours,
     minutes: 24 * 60,
     label: "Last 24 hours",
   },
-  defaultTimeOption,
+  defaultTimeOptionValue,
   {
     type: "minutes",
-    id: "last-30-days",
+    id: TimeOptionId.LastThirtyDays,
     minutes: 30 * 24 * 60,
     label: "Last 30 days",
   },
   {
     type: "minutes",
-    id: "last-90-days",
+    id: TimeOptionId.LastNinetyDays,
     minutes: 90 * 24 * 60,
     label: "Last 90 days",
   },
-  { type: "custom", id: "custom", label: "Custom Date Range" },
+  { type: "custom", id: TimeOptionId.Custom, label: "Custom Date Range" },
 ];
 
 export const DEFAULT_DELIVERIES_TABLE_V2_PROPS: DeliveriesTableV2Props = {
@@ -581,6 +597,7 @@ interface DeliveriesTableV2Props {
   triggeringProperties?: SearchDeliveriesRequest["triggeringProperties"];
   autoReloadByDefault?: boolean;
   reloadPeriodMs?: number;
+  defaultTimeOption?: TimeOptionId;
 }
 
 function UserIdCell({ value }: { value: string }) {
@@ -653,6 +670,7 @@ export function DeliveriesTableV2({
   autoReloadByDefault = false,
   reloadPeriodMs = 30000,
   broadcastUriTemplate,
+  defaultTimeOption: defaultTimeOptionOverride = defaultTimeOptionId,
 }: DeliveriesTableV2Props) {
   const { workspace } = useAppStorePick(["workspace"]);
   const baseApiUrl = useBaseApiUrl();
@@ -667,13 +685,13 @@ export function DeliveriesTableV2({
     useDeliveriesFilterState();
   const initialEndDate = useMemo(() => new Date(), []);
   const initialStartDate = useMemo(
-    () => subMinutes(initialEndDate, defaultTimeOption.minutes),
+    () => subMinutes(initialEndDate, defaultTimeOptionValue.minutes),
     [initialEndDate],
   );
 
   const [state, setState] = useImmer<State>({
     previewMessageId: null,
-    selectedTimeOption: defaultTimeOption.id,
+    selectedTimeOption: defaultTimeOptionOverride,
     referenceDate: new Date(),
     customDateRange: null,
     query: {
@@ -811,7 +829,7 @@ export function DeliveriesTableV2({
           if (delivery.broadcastId) {
             queryParams.id = delivery.broadcastId;
           }
-          queryParams[BroadcastQueryKeys.STEP] = BroadcastStepKeys.REVIEW;
+          queryParams[BroadcastQueryKeys.STEP] = BroadcastStepKeys.DELIVERIES;
         } else {
           uriTemplate = originUriTemplate;
         }

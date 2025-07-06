@@ -37,6 +37,7 @@ export async function buildWorker(otel?: OpenTelemetry) {
     taskQueue,
     maxCachedWorkflows,
     reuseContext: reuseV8Context,
+    useTemporalVersioning,
   } = config();
 
   const sinks: WorkerOptions["sinks"] = {
@@ -86,6 +87,12 @@ export async function buildWorker(otel?: OpenTelemetry) {
 
   if (maxCachedWorkflows) {
     opts.maxCachedWorkflows = maxCachedWorkflows;
+  }
+
+  const { appVersion } = backendConfig();
+  if (appVersion && useTemporalVersioning) {
+    opts.buildId = appVersion;
+    opts.useVersioning = true;
   }
 
   const worker = await Worker.create(opts);

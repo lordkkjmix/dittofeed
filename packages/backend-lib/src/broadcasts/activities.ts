@@ -2,6 +2,7 @@ import { zonedTimeToUtc } from "date-fns-tz";
 import { and, eq } from "drizzle-orm";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
+import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import { omit } from "remeda";
 import { v5 as uuidV5 } from "uuid";
 
@@ -32,6 +33,7 @@ import {
   GetUsersResponseItem,
   InternalEventType,
   JSONValue,
+  MessageSendFailure,
   MessageTags,
   SavedSegmentResource,
   TrackData,
@@ -187,6 +189,19 @@ async function getUnmessagedUsers(
     ),
     nextCursor,
   };
+}
+
+function isNonRetryableError(error: MessageSendFailure): boolean {
+  switch (error.type) {
+    case InternalEventType.MessageFailure:
+      return true;
+    case InternalEventType.BadWorkspaceConfiguration:
+      return true;
+    case InternalEventType.MessageSkipped:
+      return false;
+    default:
+      assertUnreachable(error);
+  }
 }
 
 export function sendMessagesFactory(sender: Sender) {
@@ -397,9 +412,11 @@ export function sendMessagesFactory(sender: Sender) {
           batch: events,
         },
       });
-      const includesNonRetryableError = results.some(({ result }) =>
-        result.isErr(),
-      );
+      const includesNonRetryableError =
+        config.errorHandling === "PauseOnError" &&
+        results.some(
+          ({ result }) => result.isErr() && isNonRetryableError(result.error),
+        );
       return {
         messagesSent: results.length,
         nextCursor,
@@ -463,6 +480,63 @@ export async function getZonedTimestamp({
   }
 }
 
+function canTransitionToStatus(
+  currentStatus: BroadcastV2Status,
+  newStatus: BroadcastV2Status,
+): boolean {
+  // Cannot transition to the same status
+  if (currentStatus === newStatus) {
+    return false;
+  }
+
+  switch (currentStatus) {
+    case "Draft":
+      // From Draft, can start (Running), schedule, or cancel
+      return (
+        newStatus === "Running" ||
+        newStatus === "Scheduled" ||
+        newStatus === "Cancelled"
+      );
+
+    case "Scheduled":
+      // From Scheduled, can start (Running) or cancel
+      return newStatus === "Running" || newStatus === "Cancelled";
+
+    case "Running":
+      // From Running, can pause, complete, fail, or cancel
+      return (
+        newStatus === "Paused" ||
+        newStatus === "Completed" ||
+        newStatus === "Failed" ||
+        newStatus === "Cancelled"
+      );
+
+    case "Paused":
+      // From Paused, can resume (Running), fail, or cancel
+      return (
+        newStatus === "Running" ||
+        newStatus === "Failed" ||
+        newStatus === "Cancelled"
+      );
+
+    case "Completed":
+      // Completed is a terminal state - no transitions allowed
+      return false;
+
+    case "Cancelled":
+      // Cancelled is a terminal state - no transitions allowed
+      return false;
+
+    case "Failed":
+      // Failed is a terminal state - no transitions allowed
+      return false;
+
+    default:
+      // Unknown status - disallow transition
+      return false;
+  }
+}
+
 export async function markBroadcastStatus({
   workspaceId,
   broadcastId,
@@ -472,22 +546,58 @@ export async function markBroadcastStatus({
   broadcastId: string;
   status: BroadcastV2Status;
 }): Promise<BroadcastV2Status | null> {
-  const result = await db()
-    .update(schema.broadcast)
-    .set({
-      statusV2: status,
-    })
-    .where(
-      and(
-        eq(schema.broadcast.id, broadcastId),
-        eq(schema.broadcast.workspaceId, workspaceId),
-      ),
-    )
-    .returning();
-  if (result.length === 0) {
-    return null;
-  }
-  return result[0]?.statusV2 ?? null;
+  const result: BroadcastV2Status | null = await db().transaction(
+    async (tx) => {
+      const existing = await tx.query.broadcast.findFirst({
+        where: and(
+          eq(schema.broadcast.id, broadcastId),
+          eq(schema.broadcast.workspaceId, workspaceId),
+        ),
+      });
+      if (!existing) {
+        return null;
+      }
+      if (existing.statusV2 === status) {
+        return existing.statusV2;
+      }
+      if (existing.statusV2 === null) {
+        logger().error(
+          {
+            broadcastId,
+            workspaceId,
+            status,
+          },
+          "Broadcast status is null",
+        );
+        return null;
+      }
+      if (!canTransitionToStatus(existing.statusV2, status)) {
+        logger().error(
+          {
+            broadcastId,
+            workspaceId,
+            status,
+            currentStatus: existing.statusV2,
+          },
+          "Broadcast status transition is not valid",
+        );
+        return null;
+      }
+      await tx
+        .update(schema.broadcast)
+        .set({
+          statusV2: status,
+        })
+        .where(
+          and(
+            eq(schema.broadcast.id, broadcastId),
+            eq(schema.broadcast.workspaceId, workspaceId),
+          ),
+        );
+      return status;
+    },
+  );
+  return result;
 }
 
 export async function getBroadcastStatus({

@@ -46,6 +46,19 @@ export type JSONValue =
   | { [x: string]: JSONValue }
   | JSONValue[];
 
+export const IdOrName = Type.Union([
+  Type.Object({
+    id: Type.String(),
+    name: Type.Optional(Type.String()),
+  }),
+  Type.Object({
+    name: Type.String(),
+    id: Type.Optional(Type.String()),
+  }),
+]);
+
+export type IdOrName = Static<typeof IdOrName>;
+
 export const ResourceTypeEnum = {
   Declarative: "Declarative",
   Internal: "Internal",
@@ -1075,6 +1088,7 @@ export const MessageNode = Type.Object(
     variant: MessageVariant,
     child: Type.String(),
     syncProperties: Type.Optional(Type.Boolean()),
+    skipOnFailure: Type.Optional(Type.Boolean()),
   },
   {
     title: "Message Node",
@@ -1214,7 +1228,65 @@ export const PartialSegmentResource = Type.Composite([
 
 export type PartialSegmentResource = Static<typeof PartialSegmentResource>;
 
-export const UpsertSubscriptionGroupResource = SubscriptionGroupResource;
+export const UpsertSubscriptionGroupResourceOther = Type.Pick(
+  SubscriptionGroupResource,
+  ["workspaceId", "channel", "type"],
+);
+
+export const SubscriptionGroupUpsertValidationErrorType = {
+  IdError: "IdError",
+  UniqueConstraintViolation: "UniqueConstraintViolation",
+  BadValues: "BadValues",
+} as const;
+
+export const SubscriptionGroupUpsertValidationIdError = Type.Object({
+  type: Type.Literal(SubscriptionGroupUpsertValidationErrorType.IdError),
+  message: Type.String(),
+});
+
+export type SubscriptionGroupUpsertValidationIdError = Static<
+  typeof SubscriptionGroupUpsertValidationIdError
+>;
+
+export const SubscriptionGroupUpsertValidationUniqueConstraintViolation =
+  Type.Object({
+    type: Type.Literal(
+      SubscriptionGroupUpsertValidationErrorType.UniqueConstraintViolation,
+    ),
+    message: Type.String(),
+  });
+
+export type SubscriptionGroupUpsertValidationUniqueConstraintViolation = Static<
+  typeof SubscriptionGroupUpsertValidationUniqueConstraintViolation
+>;
+
+export const SubscriptionGroupUpsertValidationBadValues = Type.Object({
+  type: Type.Literal(SubscriptionGroupUpsertValidationErrorType.BadValues),
+  message: Type.String(),
+});
+
+export type SubscriptionGroupUpsertValidationBadValues = Static<
+  typeof SubscriptionGroupUpsertValidationBadValues
+>;
+
+export const SubscriptionGroupUpsertValidationError = Type.Union([
+  SubscriptionGroupUpsertValidationIdError,
+  SubscriptionGroupUpsertValidationUniqueConstraintViolation,
+  SubscriptionGroupUpsertValidationBadValues,
+]);
+
+export type SubscriptionGroupUpsertValidationError = Static<
+  typeof SubscriptionGroupUpsertValidationError
+>;
+
+export type UpsertSubscriptionGroupResourceOther = Static<
+  typeof UpsertSubscriptionGroupResourceOther
+>;
+
+export const UpsertSubscriptionGroupResource = Type.Composite([
+  IdOrName,
+  UpsertSubscriptionGroupResourceOther,
+]);
 
 export type UpsertSubscriptionGroupResource = Static<
   typeof UpsertSubscriptionGroupResource
@@ -1353,8 +1425,13 @@ export const GetEventsRequest = Type.Object({
   userId: Type.Optional(UserId),
   offset: Type.Optional(Type.Number()),
   limit: Type.Optional(Type.Number()),
+  // unix timestamp units ms
   startDate: Type.Optional(Type.Number()),
   endDate: Type.Optional(Type.Number()),
+  event: Type.Optional(Type.Array(Type.String())),
+  broadcastId: Type.Optional(Type.String()),
+  journeyId: Type.Optional(Type.String()),
+  eventType: Type.Optional(Type.String()),
 });
 
 export type GetEventsRequest = Static<typeof GetEventsRequest>;
@@ -1723,14 +1800,9 @@ export type GetMessageTemplatesRequest = Static<
   typeof GetMessageTemplatesRequest
 >;
 
-export const GetMessageTemplatesResponse = Type.Object(
-  {
-    templates: Type.Array(MessageTemplateResource),
-  },
-  {
-    $id: "GetMessageTemplatesResponse",
-  },
-);
+export const GetMessageTemplatesResponse = Type.Object({
+  templates: Type.Array(MessageTemplateResource),
+});
 
 export type GetMessageTemplatesResponse = Static<
   typeof GetMessageTemplatesResponse
@@ -2004,6 +2076,7 @@ export const BaseMessageUiNodeProps = Type.Object({
   templateId: Type.Optional(Type.String()),
   subscriptionGroupId: Type.Optional(Type.String()),
   syncProperties: Type.Optional(Type.Boolean()),
+  skipOnFailure: Type.Optional(Type.Boolean()),
 });
 
 export type BaseMessageUiNodeProps = Static<typeof BaseMessageUiNodeProps>;
@@ -2267,6 +2340,11 @@ export const SavedJourneyResource = Type.Union([
 export type SavedJourneyResource = Static<typeof SavedJourneyResource>;
 
 export const UpsertJourneyResource = Type.Composite([
+  IdOrName,
+  Type.Object({
+    workspaceId: Type.String(),
+    draft: Type.Optional(Nullable(JourneyDraft)),
+  }),
   Type.Partial(
     Type.Omit(
       Type.Object({
@@ -2277,23 +2355,28 @@ export const UpsertJourneyResource = Type.Composite([
       ["draft"],
     ),
   ),
-  Type.Object({
-    name: Type.String(),
-    workspaceId: Type.String(),
-    draft: Type.Optional(Nullable(JourneyDraft)),
-  }),
 ]);
 
 export type UpsertJourneyResource = Static<typeof UpsertJourneyResource>;
 
 export const GetJourneysRequest = Type.Object({
   workspaceId: Type.String(),
+  getPartial: Type.Optional(Type.Boolean()),
+  ids: Type.Optional(Type.Array(Type.String())),
+  resourceType: Type.Optional(Type.Enum(ResourceTypeEnum)),
 });
 
 export type GetJourneysRequest = Static<typeof GetJourneysRequest>;
 
+export const GetJourneysResponseItem = Type.Composite([
+  Type.Omit(SavedJourneyResource, ["definition", "draft"]),
+  Type.Partial(Type.Pick(SavedJourneyResource, ["definition", "draft"])),
+]);
+
+export type GetJourneysResponseItem = Static<typeof GetJourneysResponseItem>;
+
 export const GetJourneysResponse = Type.Object({
-  journeys: Type.Array(SavedJourneyResource),
+  journeys: Type.Array(GetJourneysResponseItem),
 });
 
 export type GetJourneysResponse = Static<typeof GetJourneysResponse>;
@@ -2696,6 +2779,7 @@ export type RenderMessageTemplateResponse = Static<
 >;
 
 export const DeleteSubscriptionGroupRequest = Type.Object({
+  workspaceId: Type.String(),
   id: Type.String(),
 });
 
@@ -4374,7 +4458,17 @@ export enum JourneyUpsertValidationErrorType {
   StatusTransitionError = "StatusTransitionError",
   IdError = "IdError",
   UniqueConstraintViolation = "UniqueConstraintViolation",
+  BadValues = "BadValues",
 }
+
+export const JourneyUpsertBadValuesError = Type.Object({
+  type: Type.Literal(JourneyUpsertValidationErrorType.BadValues),
+  message: Type.String(),
+});
+
+export type JourneyUpsertBadValuesError = Static<
+  typeof JourneyUpsertBadValuesError
+>;
 
 export const JourneyUpsertValidationConstraintViolationError = Type.Object({
   type: Type.Literal(JourneyUpsertValidationErrorType.ConstraintViolation),
@@ -4417,6 +4511,7 @@ export const JourneyUpsertValidationError = Type.Union([
   JourneyUpsertIdError,
   JourneyUpsertStatusTransitionError,
   JourneyUpsertUniqueConstraintViolationError,
+  JourneyUpsertBadValuesError,
 ]);
 
 export type JourneyUpsertValidationError = Static<
@@ -4835,8 +4930,30 @@ export type DeliveriesTableConfiguration = Static<
   typeof DeliveriesTableConfiguration
 >;
 
+export const BroadcastStepKeys = {
+  RECIPIENTS: "RECIPIENTS",
+  CONTENT: "CONTENT",
+  CONFIGURATION: "CONFIGURATION",
+  DELIVERIES: "DELIVERIES",
+  EVENTS: "EVENTS",
+} as const;
+
+export const BroadcastStepKey = Type.KeyOf(Type.Const(BroadcastStepKeys));
+
+export type BroadcastStepKey = Static<typeof BroadcastStepKey>;
+
 export const BroadcastConfiguration = Type.Object({
   type: Type.Literal(ComponentConfigurationEnum.Broadcast),
+  stepsAllowList: Type.Optional(Type.Array(BroadcastStepKey)),
+  emailProviderOverrideAllowList: Type.Optional(
+    Type.Array(EmailProviderTypeSchema),
+  ),
+  hideOverrideSelect: Type.Optional(Type.Boolean()),
+  hideScheduledSelect: Type.Optional(Type.Boolean()),
+  hideRateLimit: Type.Optional(Type.Boolean()),
+  hideDrawer: Type.Optional(Type.Boolean()),
+  hideTemplateUserPropertiesPanel: Type.Optional(Type.Boolean()),
+  showErrorHandling: Type.Optional(Type.Boolean()),
 });
 
 export type BroadcastConfiguration = Static<typeof BroadcastConfiguration>;
@@ -5305,18 +5422,6 @@ export const TriggerRecomputeRequest = Type.Object({
 });
 
 export type TriggerRecomputeRequest = Static<typeof TriggerRecomputeRequest>;
-export const IdOrName = Type.Union([
-  Type.Object({
-    id: Type.String(),
-    name: Type.Optional(Type.String()),
-  }),
-  Type.Object({
-    name: Type.String(),
-    id: Type.Optional(Type.String()),
-  }),
-]);
-
-export type IdOrName = Static<typeof IdOrName>;
 
 export const BaseUpsertBroadcastV2Request = Type.Object({
   workspaceId: Type.String(),
@@ -5383,6 +5488,27 @@ export const StartBroadcastRequest = Type.Object({
 });
 
 export type StartBroadcastRequest = Static<typeof StartBroadcastRequest>;
+
+export const PauseBroadcastRequest = Type.Object({
+  workspaceId: Type.String(),
+  broadcastId: Type.String(),
+});
+
+export type PauseBroadcastRequest = Static<typeof PauseBroadcastRequest>;
+
+export const ResumeBroadcastRequest = Type.Object({
+  workspaceId: Type.String(),
+  broadcastId: Type.String(),
+});
+
+export type ResumeBroadcastRequest = Static<typeof ResumeBroadcastRequest>;
+
+export const CancelBroadcastRequest = Type.Object({
+  workspaceId: Type.String(),
+  broadcastId: Type.String(),
+});
+
+export type CancelBroadcastRequest = Static<typeof CancelBroadcastRequest>;
 
 export const UpdateManualSegmentUsersRequest = Type.Composite([
   Type.Object({
@@ -5455,3 +5581,19 @@ export interface EmbeddedSession {
   workspaceId: string;
   occupantId?: string;
 }
+
+export const OauthFlowEnum = {
+  PopUp: "PopUp",
+  Redirect: "Redirect",
+} as const;
+
+export const OauthFlow = Type.KeyOf(Type.Const(OauthFlowEnum));
+export type OauthFlow = Static<typeof OauthFlow>;
+
+export const SetCsrfCookieRequest = Type.Object({
+  workspaceId: Type.String(),
+  csrfToken: Type.String(),
+  expiresAt: Type.String({ format: "date-time" }), // Expect ISO date string
+});
+
+export type SetCsrfCookieRequest = Static<typeof SetCsrfCookieRequest>;

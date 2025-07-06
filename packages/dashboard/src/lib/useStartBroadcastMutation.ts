@@ -5,8 +5,10 @@ import {
 } from "@tanstack/react-query";
 import axios from "axios";
 import { schemaValidate } from "isomorphic-lib/src/resultHandling/schemaValidation";
+import { sleep } from "isomorphic-lib/src/time";
 import {
   BaseMessageResponse,
+  BroadcastResourceV2,
   CompletionStatus,
   StartBroadcastRequest,
 } from "isomorphic-lib/src/types";
@@ -17,11 +19,16 @@ import { BROADCASTS_QUERY_KEY } from "./useBroadcastsQuery";
 
 export const START_BROADCAST_MUTATION_KEY = ["startBroadcast"];
 
+interface MutationContext {
+  previousBroadcast?: BroadcastResourceV2;
+}
+
 export function useStartBroadcastMutation(
   options?: UseMutationOptions<
     BaseMessageResponse,
     Error,
-    Omit<StartBroadcastRequest, "workspaceId">
+    Omit<StartBroadcastRequest, "workspaceId">,
+    MutationContext
   >,
 ) {
   const { workspace } = useAppStorePick(["workspace"]);
@@ -63,15 +70,77 @@ export function useStartBroadcastMutation(
   return useMutation<
     BaseMessageResponse,
     Error,
-    Omit<StartBroadcastRequest, "workspaceId">
+    Omit<StartBroadcastRequest, "workspaceId">,
+    MutationContext
   >({
     mutationFn,
     mutationKey: START_BROADCAST_MUTATION_KEY,
     ...options,
-    onSuccess: (...args) => {
-      queryClient.invalidateQueries({
+    onMutate: async (variables) => {
+      if (workspace.type !== CompletionStatus.Successful) {
+        throw new Error("Workspace not available");
+      }
+      const workspaceId = workspace.value.id;
+
+      // Cancel any outgoing refetches for the specific broadcast
+      const broadcastQueryKey = [
+        BROADCASTS_QUERY_KEY,
+        { ids: [variables.broadcastId], workspaceId },
+      ];
+      await queryClient.cancelQueries({ queryKey: broadcastQueryKey });
+
+      // Snapshot the previous value
+      const previousData =
+        queryClient.getQueryData<BroadcastResourceV2[]>(broadcastQueryKey);
+      const previousBroadcast = previousData?.[0];
+
+      // Optimistically update to the new value
+      if (previousBroadcast && previousBroadcast.version === "V2") {
+        queryClient.setQueryData<BroadcastResourceV2[]>(broadcastQueryKey, [
+          {
+            ...previousBroadcast,
+            status: previousBroadcast.scheduledAt
+              ? "Scheduled"
+              : ("Running" as const),
+          },
+        ]);
+      }
+
+      // Call the original onMutate if provided
+      await options?.onMutate?.(variables);
+
+      // Return a context object with the snapshotted value
+      return { previousBroadcast };
+    },
+    onError: (err, variables, context) => {
+      if (workspace.type !== CompletionStatus.Successful) {
+        return;
+      }
+      const workspaceId = workspace.value.id;
+
+      // If the mutation fails, use the context returned from onMutate to roll back
+      if (context?.previousBroadcast) {
+        const broadcastQueryKey = [
+          BROADCASTS_QUERY_KEY,
+          { ids: [variables.broadcastId], workspaceId },
+        ];
+        queryClient.setQueryData(broadcastQueryKey, [
+          context.previousBroadcast,
+        ]);
+      }
+      // Call the original onError if provided
+      options?.onError?.(err, variables, context);
+    },
+    onSuccess: async (...args) => {
+      // Wait before invalidating to allow backend to process
+      await sleep(2000);
+
+      // Invalidate queries - this will refresh all broadcasts queries including specific ones
+      await queryClient.invalidateQueries({
         queryKey: [BROADCASTS_QUERY_KEY],
       });
+
+      // Call the original onSuccess if provided
       options?.onSuccess?.(...args);
     },
   });

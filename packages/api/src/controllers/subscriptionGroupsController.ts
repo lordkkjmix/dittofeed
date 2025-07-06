@@ -1,6 +1,5 @@
 import { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
 import { Type } from "@sinclair/typebox";
-import { triggerWorkspaceRecompute } from "backend-lib/src/computedProperties/periods";
 import { db } from "backend-lib/src/db";
 import * as schema from "backend-lib/src/db/schema";
 import logger from "backend-lib/src/logger";
@@ -16,7 +15,7 @@ import {
   EmptyResponse,
   SavedSubscriptionGroupResource,
   SubscriptionChange,
-  SubscriptionGroupResource,
+  SubscriptionGroupUpsertValidationError,
   UpsertSubscriptionGroupAssignmentsRequest,
   UpsertSubscriptionGroupResource,
   UserUploadRow,
@@ -38,7 +37,7 @@ import {
 import { schemaValidate } from "isomorphic-lib/src/resultHandling/schemaValidation";
 import { err, ok } from "neverthrow";
 import { omit } from "remeda";
-import { v4 as uuid, validate as validateUuid } from "uuid";
+import { v4 as uuid } from "uuid";
 
 import { CsvParseResult } from "../types";
 
@@ -55,25 +54,15 @@ export default async function subscriptionGroupsController(
         body: UpsertSubscriptionGroupResource,
         response: {
           200: SavedSubscriptionGroupResource,
-          400: CsvUploadValidationError,
+          400: SubscriptionGroupUpsertValidationError,
         },
       },
     },
     async (request, reply) => {
-      if (request.body.id && !validateUuid(request.body.id)) {
-        return reply.status(400).send({
-          message: "Invalid subscription group id, must be a valid v4 UUID",
-        });
-      }
       const result = await upsertSubscriptionGroup(request.body);
       if (result.isErr()) {
-        return reply.status(400).send({
-          message: result.error.message,
-        });
+        return reply.status(400).send(result.error);
       }
-      await triggerWorkspaceRecompute({
-        workspaceId: result.value.workspaceId,
-      });
       const resource = subscriptionGroupToResource(result.value);
       return reply.status(200).send(resource);
     },
@@ -298,7 +287,7 @@ export default async function subscriptionGroupsController(
           workspaceId: WorkspaceId,
         }),
         response: {
-          200: Type.Array(SubscriptionGroupResource),
+          200: Type.Array(SavedSubscriptionGroupResource),
         },
       },
     },

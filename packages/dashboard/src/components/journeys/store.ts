@@ -35,6 +35,7 @@ import {
   JourneyUiBodyNodeTypeProps,
   JourneyUiEdgeProps,
   MessageNode,
+  SavedJourneyResource,
   SegmentEntryNode,
   SegmentSplitNode,
   SegmentSplitVariantType,
@@ -56,6 +57,7 @@ import {
   JourneyContent,
   JourneyNodeUiProps,
   JourneyState,
+  JourneyStateForResource,
   JourneyUiEdge,
   JourneyUiEdgeType,
   JourneyUiNode,
@@ -77,11 +79,6 @@ import findNode from "./findNode";
 import { isJourneyNode } from "./isJourneyNode";
 import { isLabelNode } from "./isLabelNode";
 import { layoutNodes } from "./layoutNodes";
-
-export type JourneyStateForResource = Pick<
-  JourneyState,
-  "journeyNodes" | "journeyEdges" | "journeyNodesIndex" | "journeyName"
->;
 
 export function findDirectUiParents(
   childId: string,
@@ -382,6 +379,7 @@ function journeyDefinitionFromStateBranch(
           name: uiNode.name,
           subscriptionGroupId: uiNode.subscriptionGroupId,
           syncProperties: uiNode.syncProperties,
+          skipOnFailure: uiNode.skipOnFailure,
           variant,
           child,
         };
@@ -1129,6 +1127,13 @@ export const createJourneySlice: CreateJourneySlice = (set) => ({
       state.journeyEdges = edges;
       state.journeyNodesIndex = index;
     }),
+  initJourneyState: (stateFromJourney: JourneyStateForResource) =>
+    set((state) => {
+      state.journeyName = stateFromJourney.journeyName;
+      state.journeyEdges = stateFromJourney.journeyEdges;
+      state.journeyNodes = stateFromJourney.journeyNodes;
+      state.journeyNodesIndex = stateFromJourney.journeyNodesIndex;
+    }),
 });
 
 export function journeyBranchToState(
@@ -1254,6 +1259,7 @@ export function journeyBranchToState(
           name: node.name ?? "",
           subscriptionGroupId: node.subscriptionGroupId,
           syncProperties: node.syncProperties,
+          skipOnFailure: node.skipOnFailure,
         };
 
         let messageNode: MessageUiNodeProps;
@@ -1813,4 +1819,24 @@ export function shouldDraftBeUpdated({
   }
 
   return !deepEquals(draftFromStateResult.value, definition);
+}
+
+export function journeyResourceToState(
+  journey: SavedJourneyResource,
+): JourneyStateForResource {
+  if (journey.draft) {
+    const resource: JourneyResourceWithDraftForState = {
+      ...journey,
+      draft: journey.draft,
+    };
+    return journeyDraftToState(resource);
+  }
+  if (journey.definition) {
+    const resource: JourneyResourceWithDefinitionForState = {
+      ...journey,
+      definition: journey.definition,
+    };
+    return journeyToState(resource);
+  }
+  throw new Error("journey resource has no definition or draft");
 }

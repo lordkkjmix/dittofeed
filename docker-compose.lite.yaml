@@ -37,7 +37,10 @@ services:
     environment:
       <<: *backend-app-env
       # comment out after initial setup
-      BOOTSTRAP: "true"
+      BOOTSTRAP: ${BOOTSTRAP:-true}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-password}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
     # README: To add local env variables uncomment the following line and add a .env file in the root directory
     # env_file:
     #   - .env
@@ -113,7 +116,7 @@ services:
     environment:
       - POSTGRES_PASSWORD=${DATABASE_PASSWORD:-password}
       - POSTGRES_USER=${DATABASE_USER:-postgres}
-      - POSTGRES_DB=dittofeed
+      - POSTGRES_DB=${POSTGRES_DB:-dittofeed}
     #ports:
     #  - "5432:5432"
     volumes:
@@ -150,8 +153,8 @@ services:
     #  - "9000:9000"
     #  - "9001:9001"
     environment:
-      MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: password
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password}
     volumes:
       - blob-storage:/data
     command: server --console-address ":9001" /data

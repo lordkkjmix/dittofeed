@@ -2,6 +2,7 @@ import { CalendarDate } from "@internationalized/date";
 import {
   Computer,
   ContentCopy as ContentCopyIcon,
+  Download as DownloadIcon,
   Home,
   KeyboardArrowLeft,
   KeyboardArrowRight,
@@ -13,6 +14,7 @@ import {
 import {
   Box,
   CircularProgress,
+  Divider,
   FormControl,
   IconButton,
   MenuItem,
@@ -53,17 +55,25 @@ import {
 } from "isomorphic-lib/src/types";
 import Link from "next/link";
 import { useCallback, useMemo, useRef, useState } from "react";
+import { omit } from "remeda";
 import { Updater, useImmer } from "use-immer";
 import { v4 as uuid } from "uuid";
 
 import { useAppStorePick } from "../lib/appStore";
 import { toCalendarDate } from "../lib/dates";
 import { EventResources } from "../lib/types";
+import { useDownloadEventsMutation } from "../lib/useDownloadEventsMutation";
 import { useEventsQuery } from "../lib/useEventsQuery";
 import EventDetailsSidebar from "./eventDetailsSidebar";
-import { GreyButton } from "./greyButtonStyle";
+import { GreyButton, greyButtonStyle } from "./greyButtonStyle";
 import { greyMenuItemStyles, greySelectStyles } from "./greyScaleStyles";
 import { RangeCalendar } from "./rangeCalendar";
+import {
+  getFilterValues,
+  NewUserEventsFilterButton,
+  SelectedUserEventsFilters,
+  useUserEventsFilterState,
+} from "./userEvents/userEventsFilter";
 
 export const TimeOptionId = {
   LastSevenDays: "last-7-days",
@@ -150,6 +160,7 @@ interface State {
     broadcastId?: string;
     journeyId?: string;
     eventType?: string;
+    messageId?: string;
   };
   previewEvent: GetEventsResponseItem | null;
   selectedEventResources: EventResources[];
@@ -431,11 +442,15 @@ interface UserEventsTableProps {
   searchTerm?: string;
   startDate?: number;
   endDate?: number;
-  event?: string[];
-  broadcastId?: string;
-  journeyId?: string;
-  eventType?: string;
   defaultTimeOption?: TimeOptionId;
+  hardcodedFilters?: {
+    event?: string[];
+    broadcastId?: string;
+    journeyId?: string;
+    eventType?: string;
+    messageId?: string;
+    userId?: string;
+  };
 }
 
 export function UserEventsTable({
@@ -443,11 +458,8 @@ export function UserEventsTable({
   searchTerm: initialSearchTerm,
   startDate: propsStartDate,
   endDate: propsEndDate,
-  event,
-  broadcastId,
-  journeyId,
-  eventType,
   defaultTimeOption: defaultTimeOptionOverride = defaultTimeOptionId,
+  hardcodedFilters,
 }: UserEventsTableProps) {
   const {
     workspace,
@@ -455,6 +467,9 @@ export function UserEventsTable({
     broadcasts,
     journeys,
   } = useAppStorePick(["workspace", "messages", "broadcasts", "journeys"]);
+
+  const [userEventsFilterState, setUserEventsFilterState] =
+    useUserEventsFilterState();
 
   const initialEndDate = useMemo(
     () => propsEndDate || Date.now(),
@@ -475,10 +490,6 @@ export function UserEventsTable({
       searchTerm: initialSearchTerm,
       startDate: initialStartDate,
       endDate: initialEndDate,
-      event,
-      broadcastId,
-      journeyId,
-      eventType,
     },
     previewEvent: null,
     selectedEventResources: [],
@@ -560,9 +571,59 @@ export function UserEventsTable({
     [broadcasts, journeys, messages],
   );
 
-  const eventsQuery = useEventsQuery(state.query, {
+  const finalQuery = useMemo(() => {
+    // Get filtered values from the filter state
+    const filteredEvent = getFilterValues(userEventsFilterState, "event");
+    const filteredBroadcastId = getFilterValues(
+      userEventsFilterState,
+      "broadcastId",
+    )?.[0];
+    const filteredJourneyId = getFilterValues(
+      userEventsFilterState,
+      "journeyId",
+    )?.[0];
+    const filteredEventType = getFilterValues(
+      userEventsFilterState,
+      "eventType",
+    )?.[0];
+    const filteredMessageId = getFilterValues(
+      userEventsFilterState,
+      "messageId",
+    )?.[0];
+    const filteredUserId = getFilterValues(
+      userEventsFilterState,
+      "userId",
+    )?.[0];
+
+    // Combine hardcoded filters with dynamic filters, prioritizing hardcoded
+    return {
+      ...state.query,
+      event: hardcodedFilters?.event || filteredEvent || state.query.event,
+      broadcastId:
+        hardcodedFilters?.broadcastId ||
+        filteredBroadcastId ||
+        state.query.broadcastId,
+      journeyId:
+        hardcodedFilters?.journeyId ||
+        filteredJourneyId ||
+        state.query.journeyId,
+      eventType:
+        hardcodedFilters?.eventType ||
+        filteredEventType ||
+        state.query.eventType,
+      messageId:
+        hardcodedFilters?.messageId ||
+        filteredMessageId ||
+        state.query.messageId,
+      userId: hardcodedFilters?.userId || filteredUserId || state.query.userId,
+    };
+  }, [state.query, userEventsFilterState, hardcodedFilters]);
+
+  const eventsQuery = useEventsQuery(finalQuery, {
     placeholderData: keepPreviousData,
   });
+
+  const downloadEventsMutation = useDownloadEventsMutation();
 
   const onNextPage = useCallback(() => {
     setState((draft) => {
@@ -755,106 +816,141 @@ export function UserEventsTable({
       <Stack
         direction="row"
         alignItems="center"
-        justifyContent="space-between"
         spacing={1}
         sx={{ width: "100%", height: "48px" }}
       >
-        <Stack direction="row" spacing={2} alignItems="center">
-          <Typography variant="h6">User Events</Typography>
-          <FormControl>
-            <Select
-              value={state.selectedTimeOption}
-              renderValue={(value) => {
-                const option = timeOptions.find((o) => o.id === value);
-                if (option?.type === "custom") {
-                  return `${formatDate(new Date(state.query.startDate))} - ${formatDate(new Date(state.query.endDate))}`;
-                }
-                return option?.label;
-              }}
-              ref={customDateRef}
-              MenuProps={{
-                anchorOrigin: {
-                  vertical: "bottom",
-                  horizontal: "left",
-                },
-                transformOrigin: {
-                  vertical: "top",
-                  horizontal: "left",
-                },
-                sx: greyMenuItemStyles,
-              }}
-              sx={greySelectStyles}
-              onChange={(e) =>
-                setState((draft) => {
-                  if (e.target.value === "custom") {
-                    const dayBefore = subDays(draft.referenceDate, 1);
-                    draft.customDateRange = {
-                      start: toCalendarDate(dayBefore),
-                      end: toCalendarDate(draft.referenceDate),
-                    };
-                    return;
-                  }
-                  const option = timeOptions.find(
-                    (o) => o.id === e.target.value,
-                  );
-                  if (option === undefined || option.type !== "minutes") {
-                    return;
-                  }
-                  draft.selectedTimeOption = option.id;
-                  draft.query.startDate = subMinutes(
-                    draft.referenceDate,
-                    option.minutes,
-                  ).getTime();
-                  draft.query.endDate = draft.referenceDate.getTime();
-                  draft.query.offset = 0;
-                })
+        <Typography variant="h6">User Events</Typography>
+        <FormControl>
+          <Select
+            value={state.selectedTimeOption}
+            renderValue={(value) => {
+              const option = timeOptions.find((o) => o.id === value);
+              if (option?.type === "custom") {
+                return `${formatDate(new Date(state.query.startDate))} - ${formatDate(new Date(state.query.endDate))}`;
               }
-              size="small"
-            >
-              {timeOptions.map((option) => (
-                <MenuItem
-                  key={option.id}
-                  value={option.id}
-                  onClick={
-                    option.id === "custom" ? customOnClickHandler : undefined
-                  }
-                >
-                  {option.label}
-                </MenuItem>
-              ))}
-            </Select>
-          </FormControl>
+              return option?.label;
+            }}
+            ref={customDateRef}
+            MenuProps={{
+              anchorOrigin: {
+                vertical: "bottom",
+                horizontal: "left",
+              },
+              transformOrigin: {
+                vertical: "top",
+                horizontal: "left",
+              },
+              sx: greyMenuItemStyles,
+            }}
+            sx={greySelectStyles}
+            onChange={(e) =>
+              setState((draft) => {
+                if (e.target.value === "custom") {
+                  const dayBefore = subDays(draft.referenceDate, 1);
+                  draft.customDateRange = {
+                    start: toCalendarDate(dayBefore),
+                    end: toCalendarDate(draft.referenceDate),
+                  };
+                  return;
+                }
+                const option = timeOptions.find((o) => o.id === e.target.value);
+                if (option === undefined || option.type !== "minutes") {
+                  return;
+                }
+                draft.selectedTimeOption = option.id;
+                draft.query.startDate = subMinutes(
+                  draft.referenceDate,
+                  option.minutes,
+                ).getTime();
+                draft.query.endDate = draft.referenceDate.getTime();
+                draft.query.offset = 0;
+              })
+            }
+            size="small"
+          >
+            {timeOptions.map((option) => (
+              <MenuItem
+                key={option.id}
+                value={option.id}
+                onClick={
+                  option.id === "custom" ? customOnClickHandler : undefined
+                }
+              >
+                {option.label}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+        <Divider
+          orientation="vertical"
+          flexItem
+          sx={{ borderColor: "grey.300" }}
+        />
+        <Stack direction="row" spacing={1} flex={1} sx={{ height: "100%" }}>
+          <NewUserEventsFilterButton
+            state={userEventsFilterState}
+            setState={setUserEventsFilterState}
+            greyScale
+            buttonProps={{
+              disableRipple: true,
+              sx: {
+                ...greyButtonStyle,
+                fontWeight: "bold",
+              },
+            }}
+          />
+          <SelectedUserEventsFilters
+            state={userEventsFilterState}
+            setState={setUserEventsFilterState}
+            hardcodedFilters={hardcodedFilters}
+            sx={{
+              height: "100%",
+            }}
+          />
         </Stack>
-        <Stack direction="row" spacing={1} alignItems="center">
-          <Tooltip title="Refresh Results" placement="bottom-start">
-            <IconButton
-              disabled={state.selectedTimeOption === "custom"}
-              onClick={() => {
-                setState((draft) => {
-                  const option = timeOptions.find(
-                    (o) => o.id === draft.selectedTimeOption,
-                  );
-                  if (option === undefined || option.type !== "minutes") {
-                    return;
-                  }
-                  draft.query.offset = 0;
-                  const endDate = new Date();
-                  draft.query.endDate = endDate.getTime();
-                  draft.query.startDate = subMinutes(
-                    endDate,
-                    option.minutes,
-                  ).getTime();
-                });
-              }}
-              sx={{
-                border: "1px solid",
-                borderColor: "grey.400",
-              }}
-            >
-              <RefreshIcon />
-            </IconButton>
-          </Tooltip>
-        </Stack>
+        <Tooltip title="Download Events as CSV" placement="bottom-start">
+          <GreyButton
+            onClick={() => {
+              downloadEventsMutation.mutate(
+                omit(finalQuery, ["offset", "limit"]),
+              );
+            }}
+            startIcon={<DownloadIcon />}
+            sx={{
+              marginRight: 1,
+            }}
+          >
+            Download Events
+          </GreyButton>
+        </Tooltip>
+        <Tooltip title="Refresh Results" placement="bottom-start">
+          <IconButton
+            disabled={state.selectedTimeOption === "custom"}
+            onClick={() => {
+              setState((draft) => {
+                const option = timeOptions.find(
+                  (o) => o.id === draft.selectedTimeOption,
+                );
+                if (option === undefined || option.type !== "minutes") {
+                  return;
+                }
+                draft.query.offset = 0;
+                const endDate = new Date();
+                draft.query.endDate = endDate.getTime();
+                draft.query.startDate = subMinutes(
+                  endDate,
+                  option.minutes,
+                ).getTime();
+              });
+            }}
+            sx={{
+              border: "1px solid",
+              borderColor: "grey.400",
+            }}
+          >
+            <RefreshIcon />
+          </IconButton>
+        </Tooltip>
       </Stack>
 
       <Popover

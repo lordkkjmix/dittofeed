@@ -66,9 +66,11 @@ export async function getUsers(
   {
     allowInternalSegment = false,
     allowInternalUserProperty = false,
+    throwOnError = false,
   }: {
     allowInternalSegment?: boolean;
     allowInternalUserProperty?: boolean;
+    throwOnError?: boolean;
   } = {},
 ): Promise<Result<GetUsersResponse, Error>> {
   const childWorkspaceIds = (
@@ -164,6 +166,9 @@ export async function getUsers(
           },
           "subscription group not found",
         );
+        if (throwOnError) {
+          throw new Error("subscription group not found");
+        }
         continue;
       }
       const { type, segmentId } = sg;
@@ -256,6 +261,9 @@ export async function getUsers(
     chQuery({
       query,
       query_params: qb.getQueries(),
+      clickhouse_settings: {
+        output_format_json_named_tuples_as_objects: 0,
+      },
     }),
     db()
       .select({
@@ -291,6 +299,9 @@ export async function getUsers(
         },
         "failed to validate user property definition",
       );
+      if (throwOnError) {
+        throw definition.error;
+      }
       continue;
     }
     userPropertyById.set(property.id, {
@@ -305,6 +316,12 @@ export async function getUsers(
     segments: [string, string][];
     user_properties: [string, string][];
   }>();
+  logger().debug(
+    {
+      rows,
+    },
+    "get users rows",
+  );
   const users: GetUsersResponseItem[] = rows.map((row) => {
     const userSegments: GetUsersResponseItem["segments"] = row.segments.flatMap(
       ([id, value]) => {
@@ -320,6 +337,13 @@ export async function getUsers(
           return [];
         }
         if (!allowInternalSegment && segment.resourceType === "Internal") {
+          logger().debug(
+            {
+              segment,
+              workspaceId,
+            },
+            "skipping internal segment",
+          );
           return [];
         }
         return {
@@ -340,6 +364,9 @@ export async function getUsers(
               },
               "user property not found",
             );
+            if (throwOnError) {
+              throw new Error("user property not found");
+            }
             return acc;
           }
           const parsedValue = parseUserProperty(up.definition, value);
@@ -352,6 +379,9 @@ export async function getUsers(
               },
               "failed to parse user property value",
             );
+            if (throwOnError) {
+              throw new Error("failed to parse user property value");
+            }
             return acc;
           }
           acc[id] = {

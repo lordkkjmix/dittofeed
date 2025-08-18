@@ -10,12 +10,16 @@ import {
 } from "./db/schema";
 import {
   buildSegmentsFile,
+  calculateKeyedSegment,
   findAllSegmentAssignments,
+  findAllSegmentAssignmentsByIdsForUsers,
   findRecentlyUpdatedUsersInSegment,
   insertSegmentAssignments,
   upsertSegment,
 } from "./segments";
 import {
+  KeyedPerformedSegmentNode,
+  RelationalOperators,
   Segment,
   SegmentDefinition,
   SegmentNodeType,
@@ -461,6 +465,238 @@ describe("segments", () => {
           }),
         );
         expect(segment.status).toBe(SegmentStatusEnum.NotStarted);
+      });
+    });
+  });
+
+  describe("calculateKeyedSegment", () => {
+    describe("when using a not equals operator", () => {
+      describe("when the property does not equal the value", () => {
+        it("returns true", () => {
+          const result = calculateKeyedSegment({
+            keyValue: "order-1",
+            definition: {
+              id: randomUUID(),
+              type: SegmentNodeType.KeyedPerformed,
+              event: "order:*",
+              key: "orderId",
+              times: 1,
+              timesOperator: RelationalOperators.GreaterThanOrEqual,
+              properties: [
+                {
+                  path: "type",
+                  operator: {
+                    type: SegmentOperatorType.NotEquals,
+                    value: "test",
+                  },
+                },
+              ],
+            },
+            events: [
+              {
+                event: "order:submitted",
+                properties: {
+                  orderId: "order-1",
+                  type: "production",
+                },
+                messageId: randomUUID(),
+              },
+              {
+                event: "order:completed",
+                properties: {
+                  orderId: "order-1",
+                  type: "production",
+                },
+                messageId: randomUUID(),
+              },
+            ],
+          });
+          expect(result).toBe(true);
+        });
+      });
+    });
+  });
+
+  describe("findAllSegmentAssignmentsByIdsForUsers", () => {
+    let userId1: string;
+    let userId2: string;
+    let userId3: string;
+    let segment1: Segment;
+    let segment2: Segment;
+
+    beforeEach(async () => {
+      userId1 = randomUUID();
+      userId2 = randomUUID();
+      userId3 = randomUUID();
+      const segmentId1 = randomUUID();
+      const segmentId2 = randomUUID();
+
+      // Create two segments
+      [segment1, segment2] = await Promise.all([
+        insert({
+          table: dbSegment,
+          values: {
+            id: segmentId1,
+            workspaceId: workspace.id,
+            name: "segment1",
+            updatedAt: new Date(),
+            definition: {
+              id: randomUUID(),
+              type: SegmentNodeType.Trait,
+              path: "name",
+              operator: {
+                type: SegmentOperatorType.Equals,
+                value: "test1",
+              },
+            },
+          },
+        }).then(unwrap),
+        insert({
+          table: dbSegment,
+          values: {
+            id: segmentId2,
+            workspaceId: workspace.id,
+            name: "segment2",
+            updatedAt: new Date(),
+            definition: {
+              id: randomUUID(),
+              type: SegmentNodeType.Trait,
+              path: "name",
+              operator: {
+                type: SegmentOperatorType.Equals,
+                value: "test2",
+              },
+            },
+          },
+        }).then(unwrap),
+      ]);
+
+      // Insert segment assignments for different combinations
+      await insertSegmentAssignments([
+        // userId1 is in segment1 but not segment2
+        {
+          workspaceId: workspace.id,
+          userId: userId1,
+          segmentId: segmentId1,
+          inSegment: true,
+        },
+        {
+          workspaceId: workspace.id,
+          userId: userId1,
+          segmentId: segmentId2,
+          inSegment: false,
+        },
+        // userId2 is in segment2 but not segment1
+        {
+          workspaceId: workspace.id,
+          userId: userId2,
+          segmentId: segmentId1,
+          inSegment: false,
+        },
+        {
+          workspaceId: workspace.id,
+          userId: userId2,
+          segmentId: segmentId2,
+          inSegment: true,
+        },
+        // userId3 is in both segments
+        {
+          workspaceId: workspace.id,
+          userId: userId3,
+          segmentId: segmentId1,
+          inSegment: true,
+        },
+        {
+          workspaceId: workspace.id,
+          userId: userId3,
+          segmentId: segmentId2,
+          inSegment: true,
+        },
+      ]);
+    });
+
+    it("returns segment assignments for multiple users", async () => {
+      const results = await findAllSegmentAssignmentsByIdsForUsers({
+        workspaceId: workspace.id,
+        segmentIds: [segment1.id, segment2.id],
+        userIds: [userId1, userId2, userId3],
+      });
+
+      // Check that all users are present
+      expect(Object.keys(results)).toEqual(
+        expect.arrayContaining([userId1, userId2, userId3])
+      );
+
+      // Check userId1 assignments
+      expect(results[userId1]).toEqual(
+        expect.arrayContaining([
+          { segmentId: segment1.id, inSegment: true },
+          { segmentId: segment2.id, inSegment: false },
+        ])
+      );
+      expect(results[userId1]).toHaveLength(2);
+
+      // Check userId2 assignments
+      expect(results[userId2]).toEqual(
+        expect.arrayContaining([
+          { segmentId: segment1.id, inSegment: false },
+          { segmentId: segment2.id, inSegment: true },
+        ])
+      );
+      expect(results[userId2]).toHaveLength(2);
+
+      // Check userId3 assignments
+      expect(results[userId3]).toEqual(
+        expect.arrayContaining([
+          { segmentId: segment1.id, inSegment: true },
+          { segmentId: segment2.id, inSegment: true },
+        ])
+      );
+      expect(results[userId3]).toHaveLength(2);
+    });
+
+    it("returns assignments for a single user and segment", async () => {
+      const results = await findAllSegmentAssignmentsByIdsForUsers({
+        workspaceId: workspace.id,
+        segmentIds: [segment1.id],
+        userIds: [userId1],
+      });
+
+      expect(results).toEqual({
+        [userId1]: [{ segmentId: segment1.id, inSegment: true }],
+      });
+    });
+
+    it("handles empty user ids array", async () => {
+      const results = await findAllSegmentAssignmentsByIdsForUsers({
+        workspaceId: workspace.id,
+        segmentIds: [segment1.id, segment2.id],
+        userIds: [],
+      });
+
+      expect(results).toEqual({});
+    });
+
+    it("handles empty segment ids array", async () => {
+      const results = await findAllSegmentAssignmentsByIdsForUsers({
+        workspaceId: workspace.id,
+        segmentIds: [],
+        userIds: [userId1, userId2],
+      });
+
+      expect(results).toEqual({});
+    });
+
+    it("returns empty arrays for users with no assignments", async () => {
+      const userWithNoAssignments = randomUUID();
+      const results = await findAllSegmentAssignmentsByIdsForUsers({
+        workspaceId: workspace.id,
+        segmentIds: [segment1.id],
+        userIds: [userWithNoAssignments],
+      });
+
+      expect(results).toEqual({
+        [userWithNoAssignments]: [],
       });
     });
   });

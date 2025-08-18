@@ -3,7 +3,9 @@ import { randomUUID } from "crypto";
 import { SecretNames } from "isomorphic-lib/src/constants";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import {
+  AppFileType,
   BadWorkspaceConfigurationType,
+  Base64EncodedFile,
   ParsedWebhookBody,
   WebhookTemplateResource,
   WorkspaceTypeAppEnum,
@@ -17,6 +19,7 @@ import {
   workspace as dbWorkspace,
 } from "./db/schema";
 import {
+  batchMessageUsers,
   sendEmail,
   sendSms,
   sendWebhook,
@@ -24,8 +27,12 @@ import {
 } from "./messaging";
 import { upsertEmailProvider } from "./messaging/email";
 import { upsertSmsProvider } from "./messaging/sms";
-import { upsertSubscriptionSecret } from "./subscriptionGroups";
 import {
+  upsertSubscriptionGroup,
+  upsertSubscriptionSecret,
+} from "./subscriptionGroups";
+import {
+  BatchMessageUsersResultTypeEnum,
   ChannelType,
   EmailProviderType,
   EmailTemplateResource,
@@ -61,17 +68,11 @@ async function setupEmailTemplate(workspace: Workspace) {
       createdAt: new Date(),
     },
   }).then(unwrap);
-  const subscriptionGroupPromise = insert({
-    table: dbSubscriptionGroup,
-    values: {
-      id: randomUUID(),
-      workspaceId: workspace.id,
-      name: `group-${randomUUID()}`,
-      type: "OptOut",
-      channel: ChannelType.Email,
-      updatedAt: new Date(),
-      createdAt: new Date(),
-    },
+  const subscriptionGroupPromise = upsertSubscriptionGroup({
+    workspaceId: workspace.id,
+    name: `group-${randomUUID()}`,
+    type: SubscriptionGroupType.OptOut,
+    channel: ChannelType.Email,
   }).then(unwrap);
 
   const [template, subscriptionGroup] = await Promise.all([
@@ -563,6 +564,205 @@ describe("messaging", () => {
           UpsertMessageTemplateValidationErrorType.UniqueConstraintViolation,
         );
       });
+    });
+  });
+
+  describe("batchMessageUsers", () => {
+    describe("when sending email messages to multiple users", () => {
+      let template: MessageTemplate;
+      let subscriptionGroup: SubscriptionGroup;
+
+      beforeEach(async () => {
+        ({ template, subscriptionGroup } = await setupEmailTemplate(workspace));
+
+        // Set up email provider for the workspace
+        await upsertEmailProvider({
+          workspaceId: workspace.id,
+          config: { type: EmailProviderType.Test },
+          setDefault: true,
+        });
+      });
+
+      it("should send messages to all users and return success results", async () => {
+        const users = [
+          {
+            id: "user1",
+            properties: {
+              email: "user1@test.com",
+              firstName: "User1",
+            },
+          },
+          {
+            id: "user2",
+            properties: {
+              email: "user2@test.com",
+              firstName: "User2",
+            },
+          },
+        ];
+
+        const result = await batchMessageUsers({
+          workspaceId: workspace.id,
+          templateId: template.id,
+          subscriptionGroupId: subscriptionGroup.id,
+          channel: ChannelType.Email,
+          users,
+        });
+
+        expect(result.results).toHaveLength(2);
+        expect(result.results[0]?.type).toBe(
+          BatchMessageUsersResultTypeEnum.Success,
+        );
+        expect(result.results[0]?.userId).toBe("user1");
+        expect(result.results[1]?.type).toBe(
+          BatchMessageUsersResultTypeEnum.Success,
+        );
+        expect(result.results[1]?.userId).toBe("user2");
+      });
+
+      it("should handle users with missing email identifiers", async () => {
+        const users = [
+          {
+            id: "user1",
+            properties: {
+              firstName: "User1",
+              // Missing email
+            },
+          },
+        ];
+
+        const result = await batchMessageUsers({
+          workspaceId: workspace.id,
+          templateId: template.id,
+          subscriptionGroupId: subscriptionGroup.id,
+          channel: ChannelType.Email,
+          users,
+        });
+
+        expect(result.results).toHaveLength(1);
+        expect(result.results[0]?.type).toBe(
+          BatchMessageUsersResultTypeEnum.RetryableError,
+        );
+        expect(result.results[0]?.userId).toBe("user1");
+      });
+
+      it("should handle subscription group assignments when batching users", async () => {
+        // This test verifies that the batched subscription group functionality is called
+        // Even though we get "No segment found" errors in logs, the function should handle
+        // this gracefully and not crash
+        const users = [
+          {
+            id: "user1",
+            properties: {
+              email: "user1@test.com",
+              firstName: "User1",
+            },
+          },
+          {
+            id: "user2",
+            properties: {
+              email: "user2@test.com",
+              firstName: "User2",
+            },
+          },
+        ];
+
+        const result = await batchMessageUsers({
+          workspaceId: workspace.id,
+          templateId: template.id,
+          subscriptionGroupId: subscriptionGroup.id,
+          channel: ChannelType.Email,
+          users,
+        });
+
+        // The key test here is that batchMessageUsers completes successfully
+        // with a subscription group, proving our batched getSubscriptionGroupWithAssignments
+        // is working correctly (even when segments aren't set up)
+        expect(result.results).toHaveLength(2);
+        expect(result.results[0]?.type).toBe(
+          BatchMessageUsersResultTypeEnum.Success,
+        );
+        expect(result.results[1]?.type).toBe(
+          BatchMessageUsersResultTypeEnum.Success,
+        );
+      });
+    });
+  });
+  describe("when sending email with base64 encoded attachments", () => {
+    let template: MessageTemplate;
+
+    beforeEach(async () => {
+      // First create the email provider
+      await upsertEmailProvider({
+        workspaceId: workspace.id,
+        config: { type: EmailProviderType.Test },
+        setDefault: true,
+      });
+
+      // Then create the template
+      template = await insert({
+        table: dbMessageTemplate,
+        values: {
+          id: randomUUID(),
+          workspaceId: workspace.id,
+          name: `template-${randomUUID()}`,
+          updatedAt: new Date(),
+          createdAt: new Date(),
+          definition: {
+            type: ChannelType.Email,
+            from: "support@company.com",
+            subject: "Hello with attachment",
+            body: "<mjml><mj-body><mj-section><mj-column><mj-text>Please find the attached file.</mj-text></mj-column></mj-section></mj-body></mjml>",
+            attachmentUserProperties: ["myFile"],
+          } satisfies EmailTemplateResource,
+        },
+      }).then(unwrap);
+    });
+
+    it("should handle base64 encoded file attachments", async () => {
+      const userId = 1234;
+      const email = "test@email.com";
+
+      // Sample base64 encoded file (a simple text file)
+      const base64FileData = "SGVsbG8gV29ybGQ="; // "Hello World" in base64
+      const attachmentFile: Base64EncodedFile = {
+        type: AppFileType.Base64Encoded,
+        name: "test.txt",
+        mimeType: "text/plain",
+        data: base64FileData,
+      };
+
+      const result = await sendEmail({
+        workspaceId: workspace.id,
+        templateId: template.id,
+        messageTags: {
+          workspaceId: workspace.id,
+          templateId: template.id,
+          runId: "run-id-1",
+          messageId: randomUUID(),
+        },
+        userPropertyAssignments: {
+          email,
+          myFile: attachmentFile,
+        },
+        userId: userId.toString(),
+        useDraft: false,
+      });
+
+      expect(result.isOk()).toBe(true);
+      if (result.isOk()) {
+        expect(result.value.type).toBe(InternalEventType.MessageSent);
+        if (result.value.type === InternalEventType.MessageSent) {
+          expect(result.value.variant.type).toBe(ChannelType.Email);
+          if (result.value.variant.type === ChannelType.Email) {
+            expect(result.value.variant.attachments).toHaveLength(1);
+            expect(result.value.variant.attachments?.[0]).toEqual({
+              name: "test.txt",
+              mimeType: "text/plain",
+            });
+          }
+        }
+      }
     });
   });
 });

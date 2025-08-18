@@ -19,12 +19,7 @@ import {
 import config from "../config";
 import { HUBSPOT_INTEGRATION } from "../constants";
 import { startHubspotUserIntegrationWorkflow } from "../integrations/hubspot/signalUtils";
-import { getSubscribedSegments } from "../journeys";
-import {
-  getUserJourneyWorkflowId,
-  segmentUpdateSignal,
-  userJourneyWorkflow,
-} from "../journeys/userWorkflow";
+import { getSubscribedSegments, triggerSegmentEntryJourney } from "../journeys";
 import logger from "../logger";
 import { getMeter, withSpan, withSpanSync } from "../openTelemetry";
 import { getContext } from "../temporal/activity";
@@ -34,6 +29,7 @@ import {
   ComputedPropertyAssignment,
   ComputedPropertyStepEnum,
   ComputedPropertyUpdate,
+  CursorDirectionEnum,
   EmailSegmentNode,
   GroupChildrenUserPropertyDefinitions,
   GroupUserPropertyDefinition,
@@ -48,11 +44,11 @@ import {
   SavedIntegrationResource,
   SavedSegmentResource,
   SavedUserPropertyResource,
+  SegmentDefinition,
   SegmentHasBeenOperatorComparator,
   SegmentNode,
   SegmentNodeType,
   SegmentOperatorType,
-  SegmentUpdate,
   SubscriptionChange,
   SubscriptionGroupSegmentNode,
   SubscriptionGroupType,
@@ -65,8 +61,6 @@ import {
   getPeriodsByComputedPropertyId,
   PeriodByComputedPropertyId,
 } from "./periods";
-
-const THREE_MINUTES_IN_MS = 180000;
 
 type AsyncWrapper = <T>(fn: () => Promise<T>) => Promise<T>;
 
@@ -277,57 +271,6 @@ function subscriptionChangeToPerformed(
   };
 }
 
-async function signalJourney({
-  segmentId,
-  workspaceId,
-  segmentAssignment,
-  journey,
-}: {
-  segmentId: string;
-  workspaceId: string;
-  segmentAssignment: ComputedAssignment;
-  journey: HasStartedJourneyResource;
-}) {
-  const segmentUpdate: SegmentUpdate = {
-    segmentId,
-    currentlyInSegment: Boolean(segmentAssignment.latest_segment_value),
-    segmentVersion: new Date(segmentAssignment.max_assigned_at).getTime(),
-    type: "segment",
-  };
-
-  if (!segmentUpdate.currentlyInSegment) {
-    return;
-  }
-
-  const { workflowClient } = getContext();
-  const { id: journeyId, definition } = journey;
-
-  const workflowId = getUserJourneyWorkflowId({
-    journeyId,
-    userId: segmentAssignment.user_id,
-  });
-
-  const userId = segmentAssignment.user_id;
-
-  await workflowClient.signalWithStart<
-    typeof userJourneyWorkflow,
-    [SegmentUpdate]
-  >(userJourneyWorkflow, {
-    taskQueue: "default",
-    workflowId,
-    args: [
-      {
-        journeyId,
-        definition,
-        workspaceId,
-        userId,
-      },
-    ],
-    signal: segmentUpdateSignal,
-    signalArgs: [segmentUpdate],
-  });
-}
-
 interface FullSubQueryData {
   condition: string;
   type: "user_property" | "segment";
@@ -377,6 +320,7 @@ function segmentToIndexed({
       }
 
       switch (node.operator.type) {
+        case SegmentOperatorType.AbsoluteTimestamp:
         case SegmentOperatorType.Within: {
           return [
             {
@@ -617,6 +561,7 @@ function segmentToResolvedState({
         return [];
       }
 
+      // TODO: support absolute timestamp
       if (node.withinSeconds && node.withinSeconds > 0) {
         const withinRangeWhereClause = `
           cps_performed.workspace_id = ${workspaceIdParam}
@@ -873,10 +818,25 @@ function segmentToResolvedState({
     case SegmentNodeType.Trait: {
       const { operator } = node;
       switch (operator.type) {
+        case SegmentOperatorType.AbsoluteTimestamp:
         case SegmentOperatorType.Within: {
-          const withinLowerBound = Math.round(
-            Math.max(nowSeconds - operator.windowSeconds, 0),
-          );
+          let boundClause: string;
+          if (operator.type === SegmentOperatorType.AbsoluteTimestamp) {
+            const indexValueComparator =
+              operator.direction === CursorDirectionEnum.After ? ">=" : "<";
+            const unixTimestamp = Math.floor(
+              new Date(operator.absoluteTimestamp).getTime() / 1000,
+            );
+            boundClause = `indexed_value ${indexValueComparator} ${qb.addQueryValue(
+              unixTimestamp,
+              "Int32",
+            )}`;
+          } else {
+            const withinLowerBound = Math.round(
+              Math.max(nowSeconds - operator.windowSeconds, 0),
+            );
+            boundClause = `indexed_value >= ${qb.addQueryValue(withinLowerBound, "Int32")}`;
+          }
           const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
           const computedPropertyIdParam = qb.addQueryValue(
             segment.id,
@@ -914,7 +874,7 @@ function segmentToResolvedState({
                   cpsi.computed_property_id,
                   cpsi.state_id,
                   cpsi.user_id,
-                  indexed_value >= ${qb.addQueryValue(withinLowerBound, "Int32")} as segment_state_value
+                  ${boundClause} as segment_state_value
                 from computed_property_state_index cpsi
                 where
                   segment_state_value = True
@@ -939,7 +899,7 @@ function segmentToResolvedState({
               toDateTime64(${nowSeconds}, 3) as assigned_at
             from computed_property_state_index cpsi
             where
-              indexed_value >= ${qb.addQueryValue(withinLowerBound, "Int32")}
+              ${boundClause}
               and cpsi.workspace_id = ${workspaceIdParam}
               and cpsi.type = 'segment'
               and cpsi.computed_property_id = ${computedPropertyIdParam}
@@ -1396,9 +1356,14 @@ function segmentToResolvedState({
         : null;
 
       if (!userIdStateParam || !userIdPropertyIdParam) {
-        throw new Error(
+        logger().error(
+          {
+            segment,
+            node,
+          },
           "User ID state and property ID are required for random bucket segments",
         );
+        return [];
       }
       const stateIdParam = qb.addQueryValue(stateId, "String");
       const segmentIdParam = qb.addQueryValue(segment.id, "String");
@@ -1699,11 +1664,18 @@ export function segmentNodeToStateSubQuery({
           },
         ];
       }
-      const eventTimeExpression: string | undefined =
+      let eventTimeExpression: string | undefined;
+      if (
         node.operator.type === SegmentOperatorType.HasBeen ||
         node.operator.type === SegmentOperatorType.Within
-          ? truncateEventTimeExpression(node.operator.windowSeconds)
-          : undefined;
+      ) {
+        eventTimeExpression = truncateEventTimeExpression(
+          node.operator.windowSeconds,
+        );
+      } else if (node.operator.type === SegmentOperatorType.AbsoluteTimestamp) {
+        // Using precision / interval of 1 hour
+        eventTimeExpression = `toDateTime64(toStartOfInterval(event_time, toIntervalSecond(3600)), 3)`;
+      }
 
       return [
         {
@@ -1777,11 +1749,15 @@ export function segmentNodeToStateSubQuery({
               `Unimplemented segment operator for performed node ${operator.type} for segment: ${segment.id} and node: ${node.id}`,
             );
           }
+          case SegmentOperatorType.AbsoluteTimestamp: {
+            throw new Error("Not implemented");
+          }
           default:
             assertUnreachable(operator);
             return [];
         }
       });
+      // TODO: support absolute timestamp
       const eventTimeExpression: string | undefined = node.withinSeconds
         ? truncateEventTimeExpression(node.withinSeconds)
         : undefined;
@@ -3342,10 +3318,12 @@ async function processRowsInner({
   rows,
   workspaceId,
   subscribedJourneys,
+  segmentDefinitionById,
 }: {
   rows: unknown[];
   workspaceId: string;
   subscribedJourneys: HasStartedJourneyResource[];
+  segmentDefinitionById: Map<string, SegmentDefinition>;
 }): Promise<string | null> {
   logger().trace(
     {
@@ -3386,6 +3364,15 @@ async function processRowsInner({
 
   await Promise.all([
     ...journeySegmentAssignments.flatMap((assignment) => {
+      const segmentId = assignment.computed_property_id;
+      const segmentDefinition = segmentDefinitionById.get(segmentId);
+      if (!segmentDefinition) {
+        logger().error(
+          { workspaceId, segmentId },
+          "Missing segment definition for triggerSegmentEntryJourney",
+        );
+        return [];
+      }
       const journey = subscribedJourneys.find(
         (j) => j.id === assignment.processed_for,
       );
@@ -3400,9 +3387,10 @@ async function processRowsInner({
         return [];
       }
 
-      return signalJourney({
+      return triggerSegmentEntryJourney({
         workspaceId,
-        segmentId: assignment.computed_property_id,
+        segmentId,
+        segmentDefinition,
         segmentAssignment: assignment,
         journey,
       });
@@ -3645,6 +3633,7 @@ type AssignmentProcessorParams = (
   | WithoutProcessorParams<UserPropertyProcessAssignmentsQueryArgs>
 ) & {
   journeys: HasStartedJourneyResource[];
+  segmentDefinitionById: Map<string, SegmentDefinition>;
 };
 
 /**
@@ -3685,7 +3674,11 @@ class AssignmentProcessor {
         const results = await withSpan(
           { name: "process-assignments-query-page" },
           async (pageSpan) => {
-            const { journeys, ...processAssignmentsParams } = this.params;
+            const {
+              journeys,
+              segmentDefinitionById,
+              ...processAssignmentsParams
+            } = this.params;
             const pageQueryId = getChCompatibleUuid();
             queryIds.push(pageQueryId);
 
@@ -3735,6 +3728,7 @@ class AssignmentProcessor {
                 rows: resultRows,
                 workspaceId: this.params.workspaceId,
                 subscribedJourneys: journeys,
+                segmentDefinitionById,
               });
 
               const pageRetrieved = resultRows.length;
@@ -3871,6 +3865,10 @@ export async function processAssignments({
     });
 
     const assignmentProcessors: AssignmentProcessor[] = [];
+    const segmentDefinitionById = new Map<string, SegmentDefinition>();
+    for (const s of segments) {
+      segmentDefinitionById.set(s.id, s.definition);
+    }
 
     for (const [segmentId, journeySet] of Array.from(subscribedJourneyMap)) {
       const segment = segmentById.get(segmentId);
@@ -3908,6 +3906,7 @@ export async function processAssignments({
           processedForUpdatedAt: journey.updatedAt,
           now,
           journeys,
+          segmentDefinitionById,
         });
         assignmentProcessors.push(processor);
       }
@@ -3950,6 +3949,7 @@ export async function processAssignments({
           now,
           processedForUpdatedAt: integration.updatedAt,
           journeys,
+          segmentDefinitionById,
         });
         assignmentProcessors.push(processor);
       }
@@ -3985,6 +3985,7 @@ export async function processAssignments({
           now,
           processedForUpdatedAt: integration.updatedAt,
           journeys,
+          segmentDefinitionById,
         });
         assignmentProcessors.push(processor);
       }

@@ -87,6 +87,7 @@ export enum InternalEventType {
   EmailDropped = "DFEmailDropped",
   EmailDelivered = "DFEmailDelivered",
   EmailOpened = "DFEmailOpened",
+  EmailProcessed = "DFEmailProcessed",
   EmailClicked = "DFEmailClicked",
   EmailBounced = "DFEmailBounced",
   EmailMarkedSpam = "DFEmailMarkedSpam",
@@ -98,6 +99,11 @@ export enum InternalEventType {
   UserTrackSignal = "DFUserTrackSignal",
   GroupUserAssignment = "DFGroupUserAssignment",
   UserGroupAssignment = "DFUserGroupAssignment",
+}
+
+export enum CursorDirectionEnum {
+  After = "after",
+  Before = "before",
 }
 
 export enum SubscriptionGroupType {
@@ -213,6 +219,7 @@ export enum SegmentOperatorType {
   NotExists = "NotExists",
   GreaterThanOrEqual = "GreaterThanOrEqual",
   LessThan = "LessThan",
+  AbsoluteTimestamp = "AbsoluteTimestamp",
 }
 
 export enum SegmentHasBeenOperatorComparator {
@@ -235,6 +242,16 @@ export const SegmentWithinOperator = Type.Object({
 });
 
 export type SegmentWithinOperator = Static<typeof SegmentWithinOperator>;
+
+export const SegmentAbsoluteTimestampOperator = Type.Object({
+  type: Type.Literal(SegmentOperatorType.AbsoluteTimestamp),
+  absoluteTimestamp: Type.String(),
+  direction: Type.Enum(CursorDirectionEnum),
+});
+
+export type SegmentAbsoluteTimestampOperator = Static<
+  typeof SegmentAbsoluteTimestampOperator
+>;
 
 export const ExistsOperator = Type.Object({
   type: Type.Literal(SegmentOperatorType.Exists),
@@ -280,6 +297,7 @@ export type SegmentLessThanOperator = Static<typeof SegmentLessThanOperator>;
 
 export const SegmentOperator = Type.Union([
   SegmentWithinOperator,
+  SegmentAbsoluteTimestampOperator,
   SegmentEqualsOperator,
   SegmentNotEqualsOperator,
   SegmentHasBeenOperator,
@@ -343,13 +361,21 @@ export enum RelationalOperators {
   LessThan = "<",
 }
 
+export enum TimeOperator {
+  Within = "Within",
+  AfterAbsolute = "AfterAbsolute",
+  BeforeAbsolute = "BeforeAbsolute",
+}
+
 export const PerformedSegmentNode = Type.Object({
   type: Type.Literal(SegmentNodeType.Performed),
   id: Type.String(),
   event: Type.String(),
   times: Type.Optional(Type.Number()),
   timesOperator: Type.Optional(Type.Enum(RelationalOperators)),
+  timeOperator: Type.Optional(Type.Enum(TimeOperator)),
   withinSeconds: Type.Optional(Type.Number()),
+  absoluteTimestamp: Type.Optional(Type.String()),
   properties: Type.Optional(
     Type.Array(
       Type.Object({
@@ -468,6 +494,7 @@ export type EveryoneSegmentNode = Static<typeof EveryoneSegmentNode>;
 
 export const KeyedPerformedPropertiesOperator = Type.Union([
   SegmentEqualsOperator,
+  SegmentNotEqualsOperator,
   ExistsOperator,
   SegmentGreaterThanOrEqualOperator,
   SegmentLessThanOperator,
@@ -896,11 +923,6 @@ export const SortDirectionEnum = {
 export const SortDirection = Type.KeyOf(Type.Const(SortDirectionEnum));
 
 export type SortDirection = Static<typeof SortDirection>;
-
-export enum CursorDirectionEnum {
-  After = "after",
-  Before = "before",
-}
 
 export enum DelayVariantType {
   Second = "Second",
@@ -1425,6 +1447,9 @@ export const GetEventsRequest = Type.Object({
   userId: Type.Optional(UserId),
   offset: Type.Optional(Type.Number()),
   limit: Type.Optional(Type.Number()),
+  messageId: Type.Optional(
+    Type.Union([Type.String(), Type.Array(Type.String())]),
+  ),
   // unix timestamp units ms
   startDate: Type.Optional(Type.Number()),
   endDate: Type.Optional(Type.Number()),
@@ -1432,6 +1457,7 @@ export const GetEventsRequest = Type.Object({
   broadcastId: Type.Optional(Type.String()),
   journeyId: Type.Optional(Type.String()),
   eventType: Type.Optional(Type.String()),
+  includeContext: Type.Optional(Type.Boolean()),
 });
 
 export type GetEventsRequest = Static<typeof GetEventsRequest>;
@@ -1467,6 +1493,7 @@ export const GetEventsResponseItem = Type.Object({
   processingTime: Type.String(),
   eventTime: Type.String(),
   traits: Type.String(),
+  context: Type.Optional(Type.String()),
 });
 
 export type GetEventsResponseItem = Static<typeof GetEventsResponseItem>;
@@ -1477,6 +1504,12 @@ export const GetEventsResponse = Type.Object({
 });
 
 export type GetEventsResponse = Static<typeof GetEventsResponse>;
+
+export const DownloadEventsRequest = Type.Omit(GetEventsRequest, [
+  "offset",
+  "limit",
+]);
+export type DownloadEventsRequest = Static<typeof DownloadEventsRequest>;
 
 export const LowCodeEmailJsonBody = Type.Recursive(
   (self) =>
@@ -1508,12 +1541,14 @@ export const LowCodeEmailJsonBody = Type.Recursive(
 
 export type LowCodeEmailJsonBody = Static<typeof LowCodeEmailJsonBody>;
 
-export enum EmailContentsType {
-  Code = "Code",
-  LowCode = "LowCode",
-}
+export const EmailContentsType = {
+  Code: "Code",
+  LowCode: "LowCode",
+} as const;
 
-export const EmailContentsTypeEnum = Type.Enum(EmailContentsType);
+export const EmailContentsTypeEnum = Type.KeyOf(Type.Const(EmailContentsType));
+
+export type EmailContentsType = Static<typeof EmailContentsTypeEnum>;
 
 export const BaseEmailContents = Type.Object({
   from: Type.String(),
@@ -2598,6 +2633,58 @@ export type WorkspaceMemberRoleResource = Static<
   typeof WorkspaceMemberRoleResource
 >;
 
+export const CreateWorkspaceMemberRoleRequest = Type.Object({
+  workspaceId: Type.String(),
+  email: Type.String(),
+  role: Role,
+});
+
+export type CreateWorkspaceMemberRoleRequest = Static<
+  typeof CreateWorkspaceMemberRoleRequest
+>;
+
+export const UpdateWorkspaceMemberRoleRequest = Type.Object({
+  workspaceId: Type.String(),
+  email: Type.String(),
+  role: Role,
+});
+
+export type UpdateWorkspaceMemberRoleRequest = Static<
+  typeof UpdateWorkspaceMemberRoleRequest
+>;
+
+export const DeleteWorkspaceMemberRoleRequest = Type.Object({
+  workspaceId: Type.String(),
+  email: Type.String(),
+});
+
+export type DeleteWorkspaceMemberRoleRequest = Static<
+  typeof DeleteWorkspaceMemberRoleRequest
+>;
+
+export const GetWorkspaceMemberRolesRequest = Type.Object({
+  workspaceId: Type.String(),
+});
+
+export type GetWorkspaceMemberRolesRequest = Static<
+  typeof GetWorkspaceMemberRolesRequest
+>;
+
+export const WorkspaceMemberWithRoles = Type.Object({
+  member: WorkspaceMemberResource,
+  roles: Type.Array(WorkspaceMemberRoleResource),
+});
+
+export type WorkspaceMemberWithRoles = Static<typeof WorkspaceMemberWithRoles>;
+
+export const GetWorkspaceMemberRolesResponse = Type.Object({
+  memberRoles: Type.Array(WorkspaceMemberWithRoles),
+});
+
+export type GetWorkspaceMemberRolesResponse = Static<
+  typeof GetWorkspaceMemberRolesResponse
+>;
+
 export interface DFRequestContext {
   workspace: WorkspaceResource & {
     type: WorkspaceTypeApp;
@@ -2611,6 +2698,7 @@ export const UserSubscriptionResource = Type.Object({
   id: Type.String(),
   name: Type.String(),
   isSubscribed: Type.Boolean(),
+  channel: Type.Enum(ChannelType),
 });
 
 export type UserSubscriptionResource = Static<typeof UserSubscriptionResource>;
@@ -2642,6 +2730,16 @@ export const SubscriptionParams = Type.Object(
           description: "Unsubscribing user from subscription group.",
         }),
       ]),
+    ),
+    isPreview: Type.Optional(
+      Type.String({
+        description: "Preview mode flag to skip subscription updates.",
+      }),
+    ),
+    showAllChannels: Type.Optional(
+      Type.String({
+        description: "Show subscription groups for all channels instead of just the changed channel.",
+      }),
     ),
   },
   {
@@ -2821,6 +2919,13 @@ export const BlobStorageFile = Type.Object(
 
 export type BlobStorageFile = Static<typeof BlobStorageFile>;
 
+export const AppDataFileInternal = Type.Union([
+  Base64EncodedFile,
+  BlobStorageFile,
+]);
+
+export type AppDataFileInternal = Static<typeof AppDataFileInternal>;
+
 export const AppDataFile = Type.Union([Base64EncodedFile], {
   description: "File associated with user event.",
 });
@@ -2868,6 +2973,7 @@ export const BaseBatchIdentifyData = {
   ...BaseAppData,
   type: Type.Literal(EventType.Identify),
   traits: Type.Optional(Traits),
+  context: AppDataContext,
 };
 
 const KnownIdentifyData = Type.Object({
@@ -2946,6 +3052,7 @@ export const BaseBatchTrackData = {
   files: AppDataFiles,
   event: TrackEventName,
   properties: Type.Optional(TrackEventProperties),
+  context: AppDataContext,
   type: Type.Literal(EventType.Track),
 };
 
@@ -3009,6 +3116,7 @@ export const BaseBatchGroupData = {
   groupId: Type.String(),
   assigned: Type.Optional(Type.Boolean()),
   traits: Type.Optional(GroupEventTraits),
+  context: AppDataContext,
   type: Type.Literal(EventType.Group),
 };
 
@@ -3082,6 +3190,7 @@ export const BaseBatchPageData = {
   ...BaseAppData,
   name: Type.Optional(PageName),
   properties: Type.Optional(PageProperties),
+  context: AppDataContext,
   type: Type.Literal(EventType.Page),
 };
 
@@ -3145,6 +3254,7 @@ export const BaseBatchScreenData = {
   ...BaseAppData,
   name: Type.Optional(ScreenName),
   properties: Type.Optional(ScreenProperties),
+  context: AppDataContext,
   type: Type.Literal(EventType.Screen),
 };
 
@@ -3650,8 +3760,19 @@ export type MessageEmailSuccess = Static<typeof MessageEmailSuccess>;
 
 export const WebhookResponse = Type.Object({
   status: Type.Optional(Type.Number()),
-  headers: Type.Optional(Type.Record(Type.String(), Type.String())),
-  body: Type.Unknown(),
+  headers: Type.Optional(
+    Type.Record(
+      Type.String(),
+      Type.Union([
+        Type.String(),
+        Type.Number(),
+        Type.Array(Type.String()),
+        Type.Null(),
+        Type.Boolean(),
+      ]),
+    ),
+  ),
+  body: Type.Optional(Type.Unknown()),
 });
 
 export type WebhookResponse = Static<typeof WebhookResponse>;
@@ -4026,6 +4147,15 @@ export const MessageSkippedFailure = Type.Object({
 });
 
 export type MessageSkippedFailure = Static<typeof MessageSkippedFailure>;
+
+export const NonRetryableMessageSendFailure = Type.Union([
+  MessageSendBadConfiguration,
+  MessageServiceFailure,
+]);
+
+export type NonRetryableMessageSendFailure = Static<
+  typeof NonRetryableMessageSendFailure
+>;
 
 export const MessageSendFailure = Type.Union([
   MessageSendBadConfiguration,
@@ -4781,10 +4911,10 @@ export type TombstoneWorkspaceRequest = Static<
 export const BaseDeliveryBodyRequest = {
   workspaceId: Type.String(),
   userId: Type.String(),
-  journeyId: Type.Optional(Type.Null()),
-  templateId: Type.Optional(Type.Null()),
-  triggeringMessageId: Type.Optional(Type.Null()),
-  messageId: Type.Optional(Type.Null()),
+  journeyId: Type.Optional(Type.String()),
+  templateId: Type.Optional(Type.String()),
+  triggeringMessageId: Type.Optional(Type.String()),
+  messageId: Type.Optional(Type.String()),
 };
 
 export const JourneyTemplateDeliveryBodyRequest = Type.Object({
@@ -4800,7 +4930,6 @@ export type JourneyTemplateDeliveryBodyRequest = Static<
 export const TriggeringMessageDeliveryBodyRequest = Type.Object({
   ...BaseDeliveryBodyRequest,
   triggeringMessageId: Type.String(),
-  templateId: Type.Optional(Type.String()),
 });
 
 export type TriggeringMessageDeliveryBodyRequest = Static<
@@ -4881,6 +5010,7 @@ export type UpsertUserPropertyError = Static<typeof UpsertUserPropertyError>;
 export const ComponentConfigurationEnum = {
   DeliveriesTable: "DeliveriesTable",
   Broadcast: "Broadcast",
+  MessageTemplate: "MessageTemplate",
 } as const;
 
 export const DeliveriesAllowedColumnEnum = {
@@ -4942,6 +5072,17 @@ export const BroadcastStepKey = Type.KeyOf(Type.Const(BroadcastStepKeys));
 
 export type BroadcastStepKey = Static<typeof BroadcastStepKey>;
 
+export const LowCodeEmailDefaultTypeEnum = {
+  Informative: "Informative",
+  Empty: "Empty",
+} as const;
+
+export const LowCodeEmailDefaultType = Type.KeyOf(
+  Type.Const(LowCodeEmailDefaultTypeEnum),
+);
+
+export type LowCodeEmailDefaultType = Static<typeof LowCodeEmailDefaultType>;
+
 export const BroadcastConfiguration = Type.Object({
   type: Type.Literal(ComponentConfigurationEnum.Broadcast),
   stepsAllowList: Type.Optional(Type.Array(BroadcastStepKey)),
@@ -4954,13 +5095,26 @@ export const BroadcastConfiguration = Type.Object({
   hideDrawer: Type.Optional(Type.Boolean()),
   hideTemplateUserPropertiesPanel: Type.Optional(Type.Boolean()),
   showErrorHandling: Type.Optional(Type.Boolean()),
+  allowedEmailContentsTypes: Type.Optional(Type.Array(EmailContentsTypeEnum)),
+  lowCodeEmailDefaultType: Type.Optional(LowCodeEmailDefaultType),
 });
 
 export type BroadcastConfiguration = Static<typeof BroadcastConfiguration>;
 
+export const MessageTemplateConfiguration = Type.Object({
+  type: Type.Literal(ComponentConfigurationEnum.MessageTemplate),
+  allowedEmailContentsTypes: Type.Optional(Type.Array(EmailContentsTypeEnum)),
+  lowCodeEmailDefaultType: Type.Optional(LowCodeEmailDefaultType),
+});
+
+export type MessageTemplateConfiguration = Static<
+  typeof MessageTemplateConfiguration
+>;
+
 export const ComponentConfigurationDefinition = Type.Union([
   DeliveriesTableConfiguration,
   BroadcastConfiguration,
+  MessageTemplateConfiguration,
 ]);
 
 export type ComponentConfigurationDefinition = Static<
@@ -5249,9 +5403,26 @@ export const SearchDeliveriesRequest = Type.Object({
   groupId: Type.Optional(
     Type.Union([Type.String(), Type.Array(Type.String())]),
   ),
+  contextValues: Type.Optional(
+    Type.Array(
+      Type.Object({
+        key: Type.String(),
+        value: Type.Union([Type.String(), Type.Number()]),
+      }),
+    ),
+  ),
 });
 
 export type SearchDeliveriesRequest = Static<typeof SearchDeliveriesRequest>;
+
+export const DownloadDeliveriesRequest = Type.Omit(SearchDeliveriesRequest, [
+  "limit",
+  "cursor",
+]);
+
+export type DownloadDeliveriesRequest = Static<
+  typeof DownloadDeliveriesRequest
+>;
 
 export const BroadcastConfigTypeEnum = {
   V2: "V2",
@@ -5597,3 +5768,304 @@ export const SetCsrfCookieRequest = Type.Object({
 });
 
 export type SetCsrfCookieRequest = Static<typeof SetCsrfCookieRequest>;
+
+export interface UserEventV2 {
+  event_type: string;
+  event: string;
+  event_time: string;
+  message_id: string;
+  user_id: string;
+  anonymous_id: string;
+  user_or_anonymous_id: string;
+  properties: string;
+  processing_time: string;
+  message_raw: string;
+  workspace_id: string;
+}
+
+export const BaseBatchMessageUsersRequestUser = Type.Object({
+  id: Type.String(),
+  messageId: Type.Optional(
+    Type.String({
+      description:
+        "Message Id to set on the tracked event. If not provided, a message id will be generated.",
+    }),
+  ),
+  properties: Type.Record(Type.String(), Type.Any(), {
+    description:
+      "User property values to be rendered in the message, keyed by name. Will override values present on the user.",
+  }),
+  context: Type.Optional(
+    Type.Record(Type.String(), Type.Any(), {
+      description:
+        "Context values for this specific user's events. Will override batch-level context values.",
+    }),
+  ),
+});
+
+export type BaseBatchMessageUsersRequestUser = Static<
+  typeof BaseBatchMessageUsersRequestUser
+>;
+
+export const BaseBatchMessageUsersRequest = {
+  workspaceId: Type.String(),
+  templateId: Type.String(),
+  subscriptionGroupId: Type.Optional(Type.String()),
+  users: Type.Array(BaseBatchMessageUsersRequestUser),
+  context: Type.Optional(Type.Record(Type.String(), Type.Any())),
+};
+
+export const EmailBatchMessageUsersRequest = Type.Object({
+  ...BaseBatchMessageUsersRequest,
+  channel: Type.Literal(ChannelType.Email),
+  provider: Type.Optional(Type.Enum(EmailProviderType)),
+});
+
+export type EmailBatchMessageUsersRequest = Static<
+  typeof EmailBatchMessageUsersRequest
+>;
+
+export const SmsBatchMessageUsersRequest = Type.Object({
+  ...BaseBatchMessageUsersRequest,
+  channel: Type.Literal(ChannelType.Sms),
+  provider: Type.Optional(Type.Enum(SmsProviderType)),
+});
+
+export type SmsBatchMessageUsersRequest = Static<
+  typeof SmsBatchMessageUsersRequest
+>;
+
+export const WebBatchMessageUsersRequest = Type.Object({
+  ...BaseBatchMessageUsersRequest,
+  channel: Type.Literal(ChannelType.Webhook),
+  provider: Type.Optional(Type.Null()),
+});
+
+export type WebBatchMessageUsersRequest = Static<
+  typeof WebBatchMessageUsersRequest
+>;
+
+export const BatchMessageUsersRequest = Type.Union([
+  EmailBatchMessageUsersRequest,
+  SmsBatchMessageUsersRequest,
+  WebBatchMessageUsersRequest,
+]);
+
+export type BatchMessageUsersRequest = Static<typeof BatchMessageUsersRequest>;
+
+export const BatchMessageUsersResultTypeEnum = {
+  Success: "Success",
+  Skipped: "Skipped",
+  RetryableError: "RetryableError",
+  NonRetryableError: "NonRetryableError",
+} as const;
+
+export const BatchMessageUsersResultType = Type.KeyOf(
+  Type.Const(BatchMessageUsersResultTypeEnum),
+);
+
+export type BatchMessageUsersResultType = Static<
+  typeof BatchMessageUsersResultType
+>;
+
+export const BaseBatchMessageUsersResult = {
+  userId: Type.String(),
+};
+
+export const BatchMessageUsersResultRetryableError = Type.Object({
+  ...BaseBatchMessageUsersResult,
+  type: Type.Literal(BatchMessageUsersResultTypeEnum.RetryableError),
+  messageId: Type.String(),
+  error: Type.Composite([
+    Type.Record(Type.String(), Type.Any()),
+    Type.Object({
+      message: Type.String(),
+    }),
+  ]),
+});
+
+export type BatchMessageUsersResultRetryableError = Static<
+  typeof BatchMessageUsersResultRetryableError
+>;
+
+export const BatchMessageUsersResult = Type.Union([
+  Type.Object({
+    ...BaseBatchMessageUsersResult,
+    type: Type.Literal(BatchMessageUsersResultTypeEnum.Success),
+    messageId: Type.String(),
+  }),
+  Type.Object({
+    ...BaseBatchMessageUsersResult,
+    type: Type.Literal(BatchMessageUsersResultTypeEnum.Skipped),
+    reason: Type.String(),
+    messageId: Type.String(),
+  }),
+  BatchMessageUsersResultRetryableError,
+  Type.Object({
+    ...BaseBatchMessageUsersResult,
+    type: Type.Literal(BatchMessageUsersResultTypeEnum.NonRetryableError),
+    messageId: Type.String(),
+    error: NonRetryableMessageSendFailure,
+  }),
+]);
+
+export type BatchMessageUsersResult = Static<typeof BatchMessageUsersResult>;
+
+export const BatchMessageUsersResponse = Type.Object({
+  results: Type.Array(BatchMessageUsersResult),
+});
+
+export type BatchMessageUsersResponse = Static<
+  typeof BatchMessageUsersResponse
+>;
+
+export const GetAnalysisRequest = Type.Object({
+  workspaceId: Type.String(),
+  channel: Type.Optional(Type.Enum(ChannelType)),
+  provider: Type.Optional(Type.Enum(EmailProviderType)),
+  userId: Type.Optional(Type.String()),
+  startDate: Type.Optional(Type.String()),
+  endDate: Type.Optional(Type.String()),
+  journeyId: Type.Optional(Type.String()),
+  broadcastId: Type.Optional(Type.String()),
+});
+
+export type GetAnalysisRequest = Static<typeof GetAnalysisRequest>;
+
+// Analysis Dashboard Types
+export const ChartGranularity = Type.Union([
+  Type.Literal("auto"),
+  Type.Literal("30second"),
+  Type.Literal("1minute"),
+  Type.Literal("5minutes"),
+  Type.Literal("10minutes"),
+  Type.Literal("30minutes"),
+  Type.Literal("1hour"),
+  Type.Literal("6hours"),
+  Type.Literal("12hours"),
+  Type.Literal("1day"),
+  Type.Literal("7days"),
+  Type.Literal("30days"),
+]);
+
+export type ChartGranularity = Static<typeof ChartGranularity>;
+
+export const GetChartDataRequest = Type.Object({
+  workspaceId: Type.String(),
+  startDate: Type.String(),
+  endDate: Type.String(),
+  granularity: Type.Optional(ChartGranularity),
+  groupBy: Type.Optional(
+    Type.Union([
+      Type.Literal("journey"),
+      Type.Literal("broadcast"),
+      Type.Literal("messageTemplate"),
+      Type.Literal("channel"),
+      Type.Literal("provider"),
+      Type.Literal("messageState"),
+    ]),
+  ),
+  filters: Type.Optional(
+    Type.Object({
+      journeyIds: Type.Optional(Type.Array(Type.String())),
+      broadcastIds: Type.Optional(Type.Array(Type.String())),
+      channels: Type.Optional(Type.Array(Type.String())),
+      providers: Type.Optional(Type.Array(Type.String())),
+      messageStates: Type.Optional(Type.Array(Type.String())),
+      templateIds: Type.Optional(Type.Array(Type.String())),
+    }),
+  ),
+});
+
+export type GetChartDataRequest = Static<typeof GetChartDataRequest>;
+
+export const GetSummarizedDataRequest = Type.Object({
+  workspaceId: Type.String(),
+  startDate: Type.String(),
+  endDate: Type.String(),
+  filters: Type.Optional(
+    Type.Object({
+      journeyIds: Type.Optional(Type.Array(Type.String())),
+      broadcastIds: Type.Optional(Type.Array(Type.String())),
+      channel: Type.Optional(Type.Enum(ChannelType)),
+      providers: Type.Optional(Type.Array(Type.String())),
+      messageStates: Type.Optional(Type.Array(Type.String())),
+      templateIds: Type.Optional(Type.Array(Type.String())),
+    }),
+  ),
+});
+
+export type GetSummarizedDataRequest = Static<typeof GetSummarizedDataRequest>;
+
+export const ChartDataPoint = Type.Object({
+  timestamp: Type.String(),
+  count: Type.Number(),
+  groupKey: Type.Optional(Type.String()),
+  groupLabel: Type.Optional(Type.String()),
+});
+
+export type ChartDataPoint = Static<typeof ChartDataPoint>;
+
+export const ResolvedChartGranularity = Type.Union([
+  Type.Literal("30second"),
+  Type.Literal("1minute"),
+  Type.Literal("5minutes"),
+  Type.Literal("10minutes"),
+  Type.Literal("30minutes"),
+  Type.Literal("1hour"),
+  Type.Literal("6hours"),
+  Type.Literal("12hours"),
+  Type.Literal("1day"),
+  Type.Literal("7days"),
+  Type.Literal("30days"),
+]);
+
+export type ResolvedChartGranularity = Static<typeof ResolvedChartGranularity>;
+
+export const GetChartDataResponse = Type.Object({
+  data: Type.Array(ChartDataPoint),
+  granularity: ResolvedChartGranularity,
+});
+
+export type GetChartDataResponse = Static<typeof GetChartDataResponse>;
+
+export const SummaryMetric = Type.Object({
+  deliveries: Type.Number(),
+  sent: Type.Number(),
+  opens: Type.Number(),
+  clicks: Type.Number(),
+  bounces: Type.Number(),
+});
+
+export type SummaryMetric = Static<typeof SummaryMetric>;
+
+export const GetSummarizedDataResponse = Type.Object({
+  summary: SummaryMetric,
+});
+
+export type GetSummarizedDataResponse = Static<
+  typeof GetSummarizedDataResponse
+>;
+
+export const GetJourneyEditorStatsRequest = Type.Object({
+  workspaceId: Type.String(),
+  journeyId: Type.String(),
+  startDate: Type.String(),
+  endDate: Type.String(),
+});
+
+export type GetJourneyEditorStatsRequest = Static<
+  typeof GetJourneyEditorStatsRequest
+>;
+
+export const JourneyNodeStats = Type.Record(Type.String(), Type.Number());
+
+export type JourneyNodeStats = Static<typeof JourneyNodeStats>;
+
+export const GetJourneyEditorStatsResponse = Type.Object({
+  nodeStats: Type.Record(Type.String(), JourneyNodeStats),
+});
+
+export type GetJourneyEditorStatsResponse = Static<
+  typeof GetJourneyEditorStatsResponse
+>;

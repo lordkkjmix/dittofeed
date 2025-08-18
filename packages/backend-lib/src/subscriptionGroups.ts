@@ -29,7 +29,7 @@ import {
 import logger from "./logger";
 import {
   findAllSegmentAssignments,
-  findAllSegmentAssignmentsByIds,
+  findAllSegmentAssignmentsByIdsForUsers,
   insertSegmentAssignments,
   SegmentBulkUpsertItem,
 } from "./segments";
@@ -103,6 +103,61 @@ export function getSubscriptionGroupDetails(
   };
 }
 
+export async function getSubscriptionGroupWithAssignments({
+  subscriptionGroupId,
+  userIds,
+}: {
+  subscriptionGroupId: string;
+  userIds: string[];
+}): Promise<SubscriptionGroupWithAssignment[]> {
+  if (!validateUuid(subscriptionGroupId)) {
+    return [];
+  }
+
+  if (userIds.length === 0) {
+    return [];
+  }
+
+  const sg = await db().query.subscriptionGroup.findFirst({
+    where: eq(dbSubscriptionGroup.id, subscriptionGroupId),
+    with: {
+      segments: true,
+    },
+  });
+
+  if (!sg?.segments[0]) {
+    logger().error(
+      {
+        workspaceId: sg?.workspaceId,
+        subscriptionGroupId,
+        userIds,
+      },
+      "No segment found for subscription group",
+    );
+    return [];
+  }
+
+  const segmentId = sg.segments[0].id;
+
+  // Use the efficient batch version
+  const assignmentsByUser = await findAllSegmentAssignmentsByIdsForUsers({
+    workspaceId: sg.workspaceId,
+    segmentIds: [segmentId],
+    userIds,
+  });
+
+  return userIds.map((userId) => {
+    const assignments = assignmentsByUser[userId] || [];
+    const value = assignments[0]?.inSegment ?? null;
+    return {
+      ...sg,
+      userId,
+      segmentId,
+      value,
+    };
+  });
+}
+
 export async function getSubscriptionGroupWithAssignment({
   subscriptionGroupId,
   userId,
@@ -110,39 +165,11 @@ export async function getSubscriptionGroupWithAssignment({
   subscriptionGroupId: string;
   userId: string;
 }): Promise<SubscriptionGroupWithAssignment | null> {
-  if (!validateUuid(subscriptionGroupId)) {
-    return null;
-  }
-  const sg = await db().query.subscriptionGroup.findFirst({
-    where: eq(dbSubscriptionGroup.id, subscriptionGroupId),
-    with: {
-      segments: true,
-    },
+  const results = await getSubscriptionGroupWithAssignments({
+    subscriptionGroupId,
+    userIds: [userId],
   });
-  if (!sg?.segments[0]) {
-    logger().error(
-      {
-        workspaceId: sg?.workspaceId,
-        subscriptionGroupId,
-        userId,
-      },
-      "No segment found for subscription group",
-    );
-    return null;
-  }
-  const segmentId = sg.segments[0].id;
-  const assignments = await findAllSegmentAssignmentsByIds({
-    workspaceId: sg.workspaceId,
-    segmentIds: [segmentId],
-    userId,
-  });
-  const value = assignments[0]?.inSegment ?? null;
-  return {
-    ...sg,
-    userId,
-    segmentId,
-    value,
-  };
+  return results[0] || null;
 }
 
 export function getSubscriptionGroupSegmentName(id: string) {
@@ -361,6 +388,8 @@ export function generateSubscriptionChangeUrl({
   identifierKey,
   changedSubscription,
   subscriptionChange,
+  isPreview,
+  showAllChannels,
 }: {
   workspaceId: string;
   userId: string;
@@ -369,6 +398,8 @@ export function generateSubscriptionChangeUrl({
   identifierKey: string;
   changedSubscription?: string;
   subscriptionChange?: SubscriptionChange;
+  isPreview?: boolean;
+  showAllChannels?: boolean;
 }): string {
   const hash = generateSubscriptionHash({
     workspaceId,
@@ -388,6 +419,12 @@ export function generateSubscriptionChangeUrl({
     params.s = changedSubscription;
     params.sub =
       subscriptionChange === SubscriptionChange.Subscribe ? "1" : "0";
+  }
+  if (isPreview) {
+    params.isPreview = "true";
+  }
+  if (showAllChannels) {
+    params.showAllChannels = "true";
   }
   const url = new URL(config().dashboardUrl);
   url.pathname = path.join("/dashboard", SUBSCRIPTION_MANAGEMENT_PAGE);
@@ -492,12 +529,13 @@ export async function getUserSubscriptions({
     }
     const inSegment = assignments[segment.id] === true;
 
-    const { id, name } = subscriptionGroup;
+    const { id, name, channel } = subscriptionGroup;
 
     subscriptions.push({
       id,
       name,
       isSubscribed: inSegment,
+      channel,
     });
   }
 

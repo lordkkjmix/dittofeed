@@ -1,7 +1,9 @@
 import { Row } from "@clickhouse/client";
+import { Counter } from "@opentelemetry/api";
 import { Type } from "@sinclair/typebox";
 import { and, eq, inArray, isNotNull, not, SQL } from "drizzle-orm";
 import { MESSAGE_EVENTS } from "isomorphic-lib/src/constants";
+import { doesEventNameMatch } from "isomorphic-lib/src/events";
 import {
   buildHeritageMap,
   getJourneyConstraintViolations,
@@ -30,19 +32,28 @@ import { QUEUE_ITEM_PRIORITIES } from "./constants";
 import { Db, db, insert, QueryError, queryResult } from "./db";
 import * as schema from "./db/schema";
 import {
+  segmentUpdateSignal,
+  userJourneyWorkflow,
+} from "./journeys/userWorkflow";
+import {
   startKeyedUserJourney,
   StartKeyedUserJourneyProps,
 } from "./journeys/userWorkflow/lifecycle";
 import logger from "./logger";
+import { getMeter } from "./openTelemetry";
 import { restartUserJourneyWorkflow } from "./restartUserJourneyWorkflow/lifecycle";
 import { findManySegmentResourcesSafe, findSegmentResource } from "./segments";
+import { getContext } from "./temporal/activity";
+import { getUserJourneyWorkflowId } from "./temporal/workflows";
 import {
   BaseMessageNodeStats,
   ChannelType,
+  ComputedAssignment,
   DeleteJourneyRequest,
   DeleteMessageTemplateRequest,
   EmailStats,
   EnrichedJourney,
+  HasStartedJourneyResource,
   InternalEventType,
   Journey,
   JourneyDefinition,
@@ -57,7 +68,9 @@ import {
   NodeStatsType,
   SavedHasStartedJourneyResource,
   SavedJourneyResource,
+  SegmentDefinition,
   SegmentNodeType,
+  SegmentUpdate,
   SmsStats,
   UpsertJourneyResource,
   WorkspaceQueueItemType,
@@ -682,8 +695,24 @@ const EVENT_TRIGGER_JOURNEY_CACHE = new NodeCache({
   checkperiod: 120,
 });
 
+let JOURNEY_TRIGGER_COUNTER: Counter | null = null;
+
+function journeyTriggerCounter() {
+  if (JOURNEY_TRIGGER_COUNTER !== null) {
+    return JOURNEY_TRIGGER_COUNTER;
+  }
+  const meter = getMeter();
+  const counter = meter.createCounter("journey_triggered_counter", {
+    description: "Counter for the number of keyed journeys triggered",
+    unit: "1",
+  });
+  JOURNEY_TRIGGER_COUNTER = counter;
+  return counter;
+}
+
 interface EventTriggerJourneyDetails {
   journeyId: string;
+  journeyName: string;
   event: string;
   definition: JourneyDefinition;
 }
@@ -740,21 +769,40 @@ export function triggerEventEntryJourneysFactory({
           event: journey.definition.entryNode.event,
           journeyId: journey.id,
           definition: journey.definition,
+          journeyName: journey.name,
         };
       });
       journeyCache.set(workspaceId, journeyDetails);
     }
 
     const starts: Promise<unknown>[] = journeyDetails.flatMap(
-      ({ journeyId, event: journeyEvent, definition }) => {
-        const isMatch = journeyEvent.endsWith("*")
-          ? triggerEvent.event.startsWith(journeyEvent.slice(0, -1))
-          : journeyEvent === triggerEvent.event;
+      ({ journeyId, journeyName, event: journeyEvent, definition }) => {
+        const isMatch = doesEventNameMatch({
+          pattern: journeyEvent,
+          event: triggerEvent.event,
+        });
 
         if (!isMatch) {
           return [];
         }
 
+        const counter = journeyTriggerCounter();
+        if (definition.entryNode.type !== JourneyNodeType.EventEntryNode) {
+          logger().error(
+            {
+              workspaceId,
+              journeyId,
+            },
+            "can't trigger non-event entry journeys using event trigger",
+          );
+          return [];
+        }
+
+        counter.add(1, {
+          workspaceId,
+          journeyName,
+          entryType: definition.entryNode.type,
+        });
         return startKeyedJourneyImpl({
           workspaceId,
           userId,
@@ -766,6 +814,86 @@ export function triggerEventEntryJourneysFactory({
     );
     await Promise.all(starts);
   };
+}
+
+export async function triggerSegmentEntryJourney({
+  workspaceId,
+  segmentId,
+  segmentAssignment,
+  journey,
+}: {
+  workspaceId: string;
+  segmentId: string;
+  // TODO: remove this. Was servicing metric tag.
+  segmentDefinition: SegmentDefinition;
+  segmentAssignment: ComputedAssignment;
+  journey: HasStartedJourneyResource;
+}) {
+  if (journey.definition.entryNode.type !== JourneyNodeType.SegmentEntryNode) {
+    logger().error(
+      {
+        workspaceId,
+        journeyId: journey.id,
+      },
+      "can't trigger non-segment entry journeys using segment trigger",
+    );
+    return;
+  }
+
+  if (journey.definition.entryNode.segment !== segmentId) {
+    logger().error(
+      {
+        workspaceId,
+        journeyId: journey.id,
+      },
+      "can't trigger segment entry journeys with different segment",
+    );
+    return;
+  }
+  const segmentUpdate: SegmentUpdate = {
+    segmentId,
+    currentlyInSegment: Boolean(segmentAssignment.latest_segment_value),
+    segmentVersion: new Date(segmentAssignment.max_assigned_at).getTime(),
+    type: "segment",
+  };
+
+  if (!segmentUpdate.currentlyInSegment) {
+    return;
+  }
+
+  const { workflowClient } = getContext();
+  const { id: journeyId, definition } = journey;
+
+  const workflowId = getUserJourneyWorkflowId({
+    journeyId,
+    userId: segmentAssignment.user_id,
+  });
+
+  const userId = segmentAssignment.user_id;
+  const counter = journeyTriggerCounter();
+  counter.add(1, {
+    workspaceId,
+    journeyName: journey.name,
+    entryType: definition.entryNode.type,
+  });
+
+  await workflowClient.signalWithStart<
+    typeof userJourneyWorkflow,
+    [SegmentUpdate]
+  >(userJourneyWorkflow, {
+    taskQueue: "default",
+    workflowId,
+    args: [
+      {
+        journeyId,
+        definition,
+        workspaceId,
+        userId,
+      },
+    ],
+    signal: segmentUpdateSignal,
+    signalArgs: [segmentUpdate],
+  });
 }
 
 export async function updateJourney({

@@ -1,5 +1,6 @@
 import * as R from "remeda";
 
+import config from "../config";
 import { BatchAppData, EventType } from "../types";
 import { InsertUserEvent, insertUserEvents } from "../userEvents";
 import { splitGroupEvents } from "./group";
@@ -25,14 +26,19 @@ export function buildBatchUserEvents(
   return batchWithMappedGroupEvents.map((message) => {
     let rest: Record<string, unknown>;
     let timestamp: string;
-    const messageRaw: Record<string, unknown> = { context };
+
+    const mergedContext = {
+      ...context,
+      ...message.context,
+    };
+    const messageRaw: Record<string, unknown> = { context: mergedContext };
 
     if (message.type === EventType.Identify) {
-      rest = R.omit(message, ["timestamp", "traits"]);
+      rest = R.omit(message, ["timestamp", "traits", "context"]);
       timestamp = message.timestamp ?? new Date().toISOString();
       messageRaw.traits = message.traits ?? {};
     } else {
-      rest = R.omit(message, ["timestamp", "properties"]);
+      rest = R.omit(message, ["timestamp", "properties", "context"]);
       timestamp = message.timestamp ?? new Date().toISOString();
 
       const properties = message.properties ?? {};
@@ -57,7 +63,7 @@ export function buildBatchUserEvents(
   });
 }
 
-export async function submitBatch(
+export async function submitBatchChunk(
   { workspaceId, data }: SubmitBatchOptions,
   {
     processingTime,
@@ -71,4 +77,26 @@ export async function submitBatch(
     workspaceId,
     userEvents,
   });
+}
+
+export async function submitBatch(
+  { workspaceId, data }: SubmitBatchOptions,
+  {
+    processingTime,
+  }: {
+    processingTime?: number;
+  } = {},
+) {
+  const { batchChunkSize } = config();
+  const chunks = R.chunk(data.batch, batchChunkSize);
+
+  await Promise.all(
+    chunks.map(async (chunk) => {
+      const chunkData = { ...data, batch: chunk };
+      return submitBatchChunk(
+        { workspaceId, data: chunkData },
+        { processingTime },
+      );
+    }),
+  );
 }

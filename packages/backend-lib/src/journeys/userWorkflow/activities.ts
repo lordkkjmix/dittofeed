@@ -1,4 +1,4 @@
-import { SpanStatusCode } from "@opentelemetry/api";
+import { Histogram, SpanStatusCode } from "@opentelemetry/api";
 import { and, eq, inArray } from "drizzle-orm";
 import { ENTRY_TYPES } from "isomorphic-lib/src/constants";
 import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
@@ -6,6 +6,10 @@ import { err, ok } from "neverthrow";
 import { omit } from "remeda";
 
 import { submitTrack } from "../../apps/track";
+import {
+  WORKFLOW_HISTORY_LENGTH_METRIC,
+  WORKFLOW_HISTORY_SIZE_METRIC,
+} from "../../constants";
 import { db } from "../../db";
 import {
   journey as dbJourney,
@@ -15,7 +19,7 @@ import {
 } from "../../db/schema";
 import logger from "../../logger";
 import { Sender, sendMessage, SendMessageParameters } from "../../messaging";
-import { withSpan } from "../../openTelemetry";
+import { getMeter, withSpan } from "../../openTelemetry";
 import { calculateKeyedSegment, getSegmentAssignmentDb } from "../../segments";
 import {
   getSubscriptionGroupDetails,
@@ -30,7 +34,6 @@ import {
   JSONValue,
   MessageTags,
   MessageVariant,
-  OptionalAllOrNothing,
   RenameKey,
   SegmentAssignment,
   SegmentDefinition,
@@ -38,6 +41,7 @@ import {
   TrackData,
   UserWorkflowTrackEvent,
 } from "../../types";
+import { getEventsById as gebi } from "../../userEvents";
 import { findAllUserPropertyAssignments } from "../../userProperties";
 import {
   recordNodeProcessed,
@@ -47,6 +51,8 @@ import { GetSegmentAssignmentVersion } from "./types";
 
 export { findNextLocalizedTime, getUserPropertyDelay } from "../../dates";
 export { findAllUserPropertyAssignments } from "../../userProperties";
+
+export { gebi as getEventsById };
 
 type BaseSendParams = {
   userId: string;
@@ -64,6 +70,7 @@ export type SendParams = Omit<BaseSendParams, "channel">;
 export type SendParamsV2 = BaseSendParams & {
   context?: Record<string, JSONValue>;
   events?: UserWorkflowTrackEvent[];
+  eventIds?: string[];
   isHidden?: boolean;
 };
 
@@ -86,8 +93,15 @@ async function sendMessageInner({
   ...rest
 }: SendParamsInner): Promise<BackendMessageSendResult> {
   let context: Record<string, JSONValue>[] | undefined;
+  // passing full events is also deprecated
   if (events) {
     context = events.flatMap((e) => e.properties ?? []);
+  } else if (rest.eventIds) {
+    const eventsById = await gebi({
+      workspaceId,
+      eventIds: rest.eventIds,
+    });
+    context = eventsById.flatMap((e) => e.properties ?? []);
   } else if (deprecatedContext) {
     context = [deprecatedContext];
   }
@@ -153,6 +167,16 @@ export function sendMessageFactory(sender: Sender) {
   return async function sendMessageWithSender(
     params: SendParamsV2,
   ): Promise<boolean> {
+    const journey = await db().query.journey.findFirst({
+      where: and(
+        eq(dbJourney.id, params.journeyId),
+        eq(dbJourney.workspaceId, params.workspaceId),
+      ),
+    });
+    if (!journey || journey.status !== "Running") {
+      return false;
+    }
+
     return withSpan({ name: "sendMessageWithSender" }, async (span) => {
       span.setAttributes({
         workspaceId: params.workspaceId,
@@ -294,20 +318,35 @@ export async function onNodeProcessedV2(params: RecordNodeProcessedParams) {
   await recordNodeProcessed(params);
 }
 
+export interface BaseGetSegmentAssignmentParams {
+  workspaceId: string;
+  segmentId: string;
+  userId: string;
+}
+
+export interface KeyedGetSegmentAssignmentParamsV1
+  extends BaseGetSegmentAssignmentParams {
+  keyValue: string;
+  nowMs: number;
+  events: UserWorkflowTrackEvent[];
+  version: GetSegmentAssignmentVersion.V1;
+}
+
+export interface KeyedGetSegmentAssignmentParamsV2
+  extends BaseGetSegmentAssignmentParams {
+  keyValue: string;
+  nowMs: number;
+  eventIds: string[];
+  version: GetSegmentAssignmentVersion.V2;
+}
+
+export type GetSegmentAssignmentParams =
+  | BaseGetSegmentAssignmentParams
+  | KeyedGetSegmentAssignmentParamsV1
+  | KeyedGetSegmentAssignmentParamsV2;
+
 export async function getSegmentAssignment(
-  params: OptionalAllOrNothing<
-    {
-      workspaceId: string;
-      segmentId: string;
-      userId: string;
-    },
-    {
-      keyValue: string;
-      nowMs: number;
-      events: UserWorkflowTrackEvent[];
-      version: GetSegmentAssignmentVersion.V1;
-    }
-  >,
+  params: GetSegmentAssignmentParams,
 ): Promise<SegmentAssignment | null> {
   return withSpan({ name: "get-segment-assignment" }, async (span) => {
     span.setAttributes({
@@ -333,14 +372,7 @@ export async function getSegmentAssignment(
       });
       return null;
     }
-    if (
-      !(
-        "version" in params &&
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-        params.version === GetSegmentAssignmentVersion.V1
-      )
-    ) {
-      span.setAttribute("version", GetSegmentAssignmentVersion.V1);
+    if (!("version" in params)) {
       const assignment =
         (await getSegmentAssignmentDb({
           workspaceId,
@@ -360,7 +392,19 @@ export async function getSegmentAssignment(
         inSegment: assignment,
       };
     }
-
+    let events: UserWorkflowTrackEvent[];
+    switch (params.version) {
+      case GetSegmentAssignmentVersion.V1:
+        events = params.events;
+        break;
+      case GetSegmentAssignmentVersion.V2: {
+        events = await gebi({
+          workspaceId,
+          eventIds: params.eventIds,
+        });
+        break;
+      }
+    }
     const definitionResult = schemaValidateWithErr(
       segment.definition,
       SegmentDefinition,
@@ -394,7 +438,7 @@ export async function getSegmentAssignment(
       };
     }
     const inSegment = calculateKeyedSegment({
-      events: params.events,
+      events,
       keyValue: params.keyValue,
       definition: entryNode,
     });
@@ -418,6 +462,35 @@ export function getWorkspace(workspaceId: string) {
 }
 
 export { getEarliestComputePropertyPeriod } from "../../computedProperties/periods";
+
+let WORKFLOW_HISTORY_SIZE_HISTOGRAM: Histogram | null = null;
+let WORKFLOW_HISTORY_LENGTH_HISTOGRAM: Histogram | null = null;
+
+function workflowHistorySizeHistogram() {
+  if (WORKFLOW_HISTORY_SIZE_HISTOGRAM !== null) {
+    return WORKFLOW_HISTORY_SIZE_HISTOGRAM;
+  }
+  const meter = getMeter();
+  const histogram = meter.createHistogram(WORKFLOW_HISTORY_SIZE_METRIC, {
+    description: "Histogram for workflow history size in bytes",
+    unit: "bytes",
+  });
+  WORKFLOW_HISTORY_SIZE_HISTOGRAM = histogram;
+  return histogram;
+}
+
+function workflowHistoryLengthHistogram() {
+  if (WORKFLOW_HISTORY_LENGTH_HISTOGRAM !== null) {
+    return WORKFLOW_HISTORY_LENGTH_HISTOGRAM;
+  }
+  const meter = getMeter();
+  const histogram = meter.createHistogram(WORKFLOW_HISTORY_LENGTH_METRIC, {
+    description: "Histogram for workflow history length in events",
+    unit: "1",
+  });
+  WORKFLOW_HISTORY_LENGTH_HISTOGRAM = histogram;
+  return histogram;
+}
 
 export async function shouldReEnter({
   journeyId,
@@ -480,4 +553,46 @@ export async function shouldReEnter({
     userId,
   });
   return assignment === true && definition.entryNode.reEnter === true;
+}
+
+// eslint-disable-next-line @typescript-eslint/require-await
+export async function reportWorkflowInfo({
+  historySize,
+  historyLength,
+  workspaceId,
+  journeyId,
+}: {
+  historySize: number;
+  historyLength: number;
+  workspaceId: string;
+  journeyId: string;
+}): Promise<void> {
+  const sizeHistogram = workflowHistorySizeHistogram();
+  const lengthHistogram = workflowHistoryLengthHistogram();
+  const journey = await db().query.journey.findFirst({
+    where: and(
+      eq(dbJourney.id, journeyId),
+      eq(dbJourney.workspaceId, workspaceId),
+    ),
+    columns: {
+      name: true,
+    },
+  });
+  if (!journey) {
+    logger().error(
+      {
+        journeyId,
+        workspaceId,
+      },
+      "journey not found",
+    );
+    return;
+  }
+
+  const attributes = {
+    workspaceId,
+    journeyName: journey.name,
+  } as const;
+  sizeHistogram.record(historySize, attributes);
+  lengthHistogram.record(historyLength, attributes);
 }

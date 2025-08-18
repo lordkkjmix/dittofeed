@@ -1,7 +1,15 @@
+import config from "backend-lib/src/config";
+import { NodeEnvEnum } from "backend-lib/src/types";
+
+/**
+ * Should only be called from server-side code.
+ * @returns
+ */
 export function apiBase(): string {
   if (process.env.DASHBOARD_API_BASE !== undefined) {
     return process.env.DASHBOARD_API_BASE;
   }
+
   const fromName =
     process.env.DASHBOARD_API_NAME &&
     process.env[process.env.DASHBOARD_API_NAME];
@@ -21,5 +29,12 @@ export function apiBase(): string {
     const base = `${protocol}://${domain}:${port}`;
     return base;
   }
-  return "http://localhost:3001";
+
+  if (config().authMode === "single-tenant") {
+    return config().dashboardUrl;
+  }
+  if (config().nodeEnv === NodeEnvEnum.Development) {
+    return "http://localhost:3001";
+  }
+  return "";
 }

@@ -84,6 +84,7 @@ function generateUnsubscribeUrl(scope: any): string {
     | undefined;
   const userProperties = allScope.user as UserPropertyAssignments;
   const identifierKey = allScope.identifier_key as string | undefined;
+  const isPreview = allScope.is_preview as boolean | undefined;
 
   const identifier = identifierKey
     ? assignmentAsString(userProperties, identifierKey)
@@ -100,6 +101,7 @@ function generateUnsubscribeUrl(scope: any): string {
       userId,
       changedSubscription: subscriptionGroupId,
       subscriptionChange: SubscriptionChange.Unsubscribe,
+      isPreview,
     });
   }
 
@@ -111,6 +113,44 @@ function generateUnsubscribeUrl(scope: any): string {
       userId,
     },
     "Unsubscribe URL not generating",
+  );
+  return "";
+}
+
+function generateSubscriptionManagementUrl(scope: any): string {
+  const allScope = scope.getAll() as Record<string, unknown>;
+  const secrets = allScope.secrets as Secrets | undefined;
+  const workspaceId = allScope.workspace_id as string;
+  const userProperties = allScope.user as UserPropertyAssignments;
+  const identifierKey = allScope.identifier_key as string | undefined;
+  const isPreview = allScope.is_preview as boolean | undefined;
+
+  const identifier = identifierKey
+    ? assignmentAsString(userProperties, identifierKey)
+    : null;
+  const userId = assignmentAsString(userProperties, "id");
+
+  const subscriptionSecret = secrets?.[SecretNames.Subscription];
+  if (subscriptionSecret && identifierKey && identifier && userId) {
+    return generateSubscriptionChangeUrl({
+      workspaceId,
+      identifier,
+      identifierKey,
+      subscriptionSecret,
+      userId,
+      isPreview,
+      showAllChannels: true,
+    });
+  }
+
+  logger().error(
+    {
+      hasSubscriptionSecret: !!subscriptionSecret,
+      identifierKey,
+      identifier,
+      userId,
+    },
+    "Subscription management URL not generating",
   );
   return "";
 }
@@ -136,6 +176,27 @@ liquidEngine.registerTag("unsubscribe_url", {
   },
 });
 
+liquidEngine.registerTag("subscription_management_link", {
+  parse(tagToken) {
+    this.contents = tagToken.args;
+  },
+  render(scope) {
+    const linkText: string =
+      (this.contents as string) || "manage subscriptions";
+    const url = generateSubscriptionManagementUrl(scope);
+    const href = url ? `href="${url}"` : "";
+
+    // Note that clicktracking=off is added to the subscription management link to prevent sendgrid from including link tracking
+    return `<a class="df-subscription-management" clicktracking=off ${href} target="_blank">${linkText}</a>`;
+  },
+});
+
+liquidEngine.registerTag("subscription_management_url", {
+  render(scope) {
+    return generateSubscriptionManagementUrl(scope);
+  },
+});
+
 const MJML_NOT_PRESENT_ERROR =
   "Check that your structure is correct and enclosed in <mjml> tags";
 
@@ -149,6 +210,8 @@ export interface RenderLiquidOptions {
   workspaceId: string;
   // TODO [DF-471] make this field required and render tags in the user property field
   tags?: MessageTags;
+  isPreview?: boolean;
+  showAllChannels?: boolean;
 }
 
 export function renderLiquid({
@@ -160,6 +223,7 @@ export function renderLiquid({
   secrets = {},
   mjml = false,
   tags,
+  isPreview = false,
 }: RenderLiquidOptions): string {
   if (!template?.length) {
     return "";
@@ -173,6 +237,7 @@ export function renderLiquid({
     identifier_key: identifierKey,
     // TODO [DF-471] remove default
     tags: tags ?? {},
+    is_preview: isPreview,
   }) as string;
   if (!mjml) {
     return liquidRendered;

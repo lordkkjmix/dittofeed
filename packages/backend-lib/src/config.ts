@@ -35,6 +35,7 @@ const BaseRawConfigProps = {
   kafkaBrokers: Type.Optional(Type.String()),
   kafkaUsername: Type.Optional(Type.String()),
   kafkaPassword: Type.Optional(Type.String()),
+  kafkaEnableAdminSasl: Type.Optional(BoolStr),
   kafkaSsl: Type.Optional(BoolStr),
   kafkaSaslMechanism: Type.Optional(KafkaSaslMechanism),
   kafkaUserEventsPartitions: Type.Optional(Type.String()),
@@ -143,6 +144,14 @@ const BaseRawConfigProps = {
     Type.String({ format: "naturalNumber" }),
   ),
   computePropertiesSplit: Type.Optional(BoolStr),
+  computePropertiesTimeout: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  // OpenTelemetry metrics export interval (milliseconds)
+  metricsExportIntervalMs: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  batchChunkSize: Type.Optional(Type.String({ format: "naturalNumber" })),
 };
 
 function defaultTemporalAddress(inputURL?: string): string {
@@ -243,6 +252,7 @@ export type Config = Overwrite<
     globalCronTaskQueue: string;
     googleOps: boolean;
     kafkaBrokers: string[];
+    kafkaEnableAdminSasl: boolean;
     kafkaSaslMechanism: KafkaSaslMechanism;
     kafkaSsl: boolean;
     kafkaUserEventsPartitions: number;
@@ -268,6 +278,9 @@ export type Config = Overwrite<
     clickhouseComputePropertiesMaxExecutionTime?: number;
     clickhouseMaxBytesRatioBeforeExternalGroupBy?: number;
     computePropertiesSplit: boolean;
+    computePropertiesTimeout: number;
+    metricsExportIntervalMs: number;
+    batchChunkSize: number;
   }
 > & {
   defaultUserEventsTableVersion: string;
@@ -496,6 +509,10 @@ function parseRawConfig(rawConfig: RawConfig): Config {
     kafkaBrokers: rawConfig.kafkaBrokers
       ? rawConfig.kafkaBrokers.split(",")
       : ["localhost:9092"],
+    kafkaEnableAdminSasl:
+      rawConfig.kafkaEnableAdminSasl !== undefined
+        ? rawConfig.kafkaEnableAdminSasl === "true"
+        : !!(rawConfig.kafkaUsername && rawConfig.kafkaPassword),
     kafkaSsl: rawConfig.kafkaSsl === "true",
     kafkaSaslMechanism: rawConfig.kafkaSaslMechanism ?? "plain",
     kafkaUserEventsPartitions: parseToNumber({
@@ -611,6 +628,15 @@ function parseRawConfig(rawConfig: RawConfig): Config {
         ? parseFloat(rawConfig.clickhouseMaxBytesRatioBeforeExternalGroupBy)
         : undefined,
     computePropertiesSplit: rawConfig.computePropertiesSplit === "true",
+    computePropertiesTimeout: rawConfig.computePropertiesTimeout
+      ? parseInt(rawConfig.computePropertiesTimeout)
+      : 5 * 60 * 1000,
+    metricsExportIntervalMs: rawConfig.metricsExportIntervalMs
+      ? parseInt(rawConfig.metricsExportIntervalMs)
+      : 60 * 1000,
+    batchChunkSize: rawConfig.batchChunkSize
+      ? parseInt(rawConfig.batchChunkSize)
+      : 100,
   };
 
   return parsedConfig;

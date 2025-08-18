@@ -5,6 +5,8 @@ import { format } from "date-fns";
 import { and, eq, inArray, InferSelectModel, not, SQL } from "drizzle-orm";
 import deepEqual from "fast-deep-equal";
 import { CHANNEL_IDENTIFIERS } from "isomorphic-lib/src/channels";
+import { stableJsonStringify } from "isomorphic-lib/src/equality";
+import { doesEventNameMatch } from "isomorphic-lib/src/events";
 import {
   schemaValidate,
   schemaValidateWithErr,
@@ -12,7 +14,7 @@ import {
 import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import { err, ok, Result } from "neverthrow";
 import { PostgresError } from "pg-error-enum";
-import { validate as validateUuid } from "uuid";
+import { v5 as uuidv5, validate as validateUuid } from "uuid";
 
 import {
   clickhouseClient,
@@ -108,6 +110,71 @@ export async function findAllSegmentAssignmentsByIds({
     segmentId: row.computed_property_id,
     inSegment: row.latest_segment_value,
   }));
+}
+
+export async function findAllSegmentAssignmentsByIdsForUsers({
+  workspaceId,
+  segmentIds,
+  userIds,
+}: {
+  workspaceId: string;
+  segmentIds: string[];
+  userIds: string[];
+}): Promise<Record<string, { segmentId: string; inSegment: boolean }[]>> {
+  if (userIds.length === 0 || segmentIds.length === 0) {
+    return {};
+  }
+
+  const qb = new ClickHouseQueryBuilder();
+  const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
+  const query = `
+    SELECT
+      user_id,
+      computed_property_id,
+      argMax(segment_value, assigned_at) as latest_segment_value
+    FROM computed_property_assignments_v2
+    WHERE
+      workspace_id = ${workspaceIdParam}
+      AND type = 'segment'
+      AND user_id IN ${qb.addQueryValue(userIds, "Array(String)")}
+      AND computed_property_id IN ${qb.addQueryValue(segmentIds, "Array(String)")}
+    GROUP BY user_id, computed_property_id
+  `;
+
+  const result = await chQuery({
+    query,
+    query_params: qb.getQueries(),
+    clickhouse_settings: {
+      select_sequential_consistency: assignmentSequentialConsistency(),
+    },
+  });
+  const rows = await result.json<{
+    user_id: string;
+    computed_property_id: string;
+    latest_segment_value: boolean;
+  }>();
+
+  // Initialize results safely for all users
+  const resultsByUser: Record<
+    string,
+    { segmentId: string; inSegment: boolean }[]
+  > = {};
+  userIds.forEach((userId) => {
+    resultsByUser[userId] = [];
+  });
+
+  // Populate results safely without non-null assertions
+  rows.forEach((row) => {
+    const userResults = resultsByUser[row.user_id];
+    if (userResults) {
+      userResults.push({
+        segmentId: row.computed_property_id,
+        inSegment: row.latest_segment_value,
+      });
+    }
+  });
+
+  return resultsByUser;
 }
 
 export async function findAllSegmentAssignments({
@@ -761,7 +828,7 @@ function filterEvent(
   },
   e: UserWorkflowTrackEvent,
 ): boolean {
-  if (e.event !== event) {
+  if (!doesEventNameMatch({ pattern: event, event: e.event })) {
     logger().debug(
       {
         event,
@@ -831,14 +898,12 @@ function filterEvent(
         mismatched = Number.isNaN(numValue) || numValue < operator.value;
         break;
       }
+      case SegmentOperatorType.NotEquals: {
+        mismatched = value === operator.value;
+        break;
+      }
       default:
-        logger().error(
-          {
-            operator,
-          },
-          "unsupported operator",
-        );
-        return false;
+        assertUnreachable(operator);
     }
 
     if (mismatched) {
@@ -1016,4 +1081,17 @@ export async function deleteSegment(
     )
     .returning();
   return result[0] ?? null;
+}
+
+const SEGMENTS_HASH_NAMESPACE = "cea974fe-c5e9-4fde-a3f1-cea2167be214";
+
+/**
+ * Hash a segment definition to a string to see if segments have equivalent definitions.
+ */
+export function getSegmentsHash({
+  definition,
+}: {
+  definition: SegmentDefinition;
+}): string {
+  return uuidv5(stableJsonStringify(definition), SEGMENTS_HASH_NAMESPACE);
 }

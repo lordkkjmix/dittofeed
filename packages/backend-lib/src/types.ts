@@ -7,7 +7,6 @@ import {
   RawRequestDefaultExpression,
   RawServerDefault,
 } from "fastify";
-import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import {
   DFRequestContext,
   EventType,
@@ -227,7 +226,11 @@ export type LogLevel = Static<typeof LogLevel>;
 export const OpenIdProfile = Type.Object({
   sub: Type.String(),
   email: Type.String(),
-  email_verified: Type.Boolean(),
+  email_verified: Type.Union([
+    Type.Literal("true"),
+    Type.Literal("false"),
+    Type.Boolean(),
+  ]),
   picture: Type.Optional(Type.String()),
   name: Type.Optional(Type.String()),
   nickname: Type.Optional(Type.String()),
@@ -579,6 +582,7 @@ export const MessageMetadataFields = Type.Object({
   templateId: Type.Optional(Type.String()),
   nodeId: Type.Optional(Type.String()),
   journeyId: Type.Optional(Type.String()),
+  broadcastId: Type.Optional(Type.String()),
 });
 
 export type MessageMetadataFields = Static<typeof MessageMetadataFields>;
@@ -588,8 +592,9 @@ export const SendgridEvent = Type.Composite([
     email: Type.String(),
     timestamp: Type.Integer(),
     event: Type.Enum(SendgridEventType),
+    "smtp-id": Type.Optional(Type.String()),
     sg_event_id: Type.String(),
-    sg_message_id: Type.String(),
+    sg_message_id: Type.Optional(Type.String()),
     ip: Type.Optional(Type.String()),
     reason: Type.Optional(Type.String()),
     pool: Type.Optional(

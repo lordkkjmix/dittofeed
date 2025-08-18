@@ -1,6 +1,13 @@
+/* eslint-disable no-await-in-loop */
 import { Type } from "@sinclair/typebox";
 import { createAdminApiKey } from "backend-lib/src/adminApiKeys";
-import { bootstrapClickhouse } from "backend-lib/src/bootstrap";
+import { submitTrackWithTriggers } from "backend-lib/src/apps";
+import { submitBatch } from "backend-lib/src/apps/batch";
+import { bootstrapClickhouse, bootstrapKafka } from "backend-lib/src/bootstrap";
+import {
+  clickhouseClient,
+  createClickhouseClient,
+} from "backend-lib/src/clickhouse";
 import { computeState } from "backend-lib/src/computedProperties/computePropertiesIncremental";
 import {
   COMPUTE_PROPERTIES_QUEUE_WORKFLOW_ID,
@@ -15,7 +22,10 @@ import {
   stopComputePropertiesWorkflowGlobal,
   terminateComputePropertiesWorkflow,
 } from "backend-lib/src/computedProperties/computePropertiesWorkflow/lifecycle";
-import { findDueWorkspaceMaxTos } from "backend-lib/src/computedProperties/periods";
+import {
+  findDueWorkspaceMaxTos,
+  findDueWorkspaceMinTos,
+} from "backend-lib/src/computedProperties/periods";
 import backendConfig, { SECRETS } from "backend-lib/src/config";
 import { db } from "backend-lib/src/db";
 import * as schema from "backend-lib/src/db/schema";
@@ -28,9 +38,9 @@ import { onboardUser } from "backend-lib/src/onboarding";
 import { findManySegmentResourcesSafe } from "backend-lib/src/segments";
 import connectWorkflowClient from "backend-lib/src/temporal/connectWorkflowClient";
 import { transferResources } from "backend-lib/src/transferResources";
-import { NodeEnvEnum, Workspace } from "backend-lib/src/types";
+import { NodeEnvEnum, UserEvent, Workspace } from "backend-lib/src/types";
 import { findAllUserPropertyResources } from "backend-lib/src/userProperties";
-import { deleteAllUsers } from "backend-lib/src/users";
+import { deleteAllUsers, getUsers } from "backend-lib/src/users";
 import {
   activateTombstonedWorkspace,
   pauseWorkspace,
@@ -47,13 +57,18 @@ import {
   schemaValidateWithErr,
 } from "isomorphic-lib/src/resultHandling/schemaValidation";
 import {
+  BatchItem,
   ChannelType,
   EmailProviderType,
+  EventType,
   FeatureName,
   FeatureNamesEnum,
   Features,
+  InternalEventType,
+  KnownTrackData,
   MessageTemplateResourceDefinition,
   SendgridSecret,
+  UserEventV2,
   WorkspaceStatusDbEnum,
   WorkspaceTypeAppEnum,
 } from "isomorphic-lib/src/types";
@@ -103,6 +118,14 @@ export function createCommands(yargs: Argv): Argv {
       (y) => y,
       async () => {
         await bootstrapClickhouse();
+      },
+    )
+    .command(
+      "bootstrap-kafka",
+      "Bootstraps kafka.",
+      (y) => y,
+      async () => {
+        await bootstrapKafka();
       },
     )
     .command(
@@ -870,6 +893,35 @@ export function createCommands(yargs: Argv): Argv {
       },
     )
     .command(
+      "find-due-workspaces-v2",
+      "Find due workspaces.",
+      (cmd) =>
+        cmd.options({
+          interval: { type: "number", alias: "i" },
+          limit: { type: "number", alias: "l" },
+        }),
+      async ({ interval, limit }) => {
+        logger().info(
+          {
+            interval,
+            limit,
+          },
+          "Finding due workspaces.",
+        );
+        const workspaces = await findDueWorkspaceMinTos({
+          now: new Date().getTime(),
+          interval,
+          limit,
+        });
+        logger().info(
+          {
+            workspaces,
+          },
+          "Found due workspaces.",
+        );
+      },
+    )
+    .command(
       "migrate",
       "Run migrations.",
       (y) => y,
@@ -1094,6 +1146,569 @@ export function createCommands(yargs: Argv): Argv {
           },
           "Current compute properties queue state",
         );
+      },
+    )
+    .command(
+      "submit-track-events",
+      "Execute a custom SQL query against ClickHouse and resubmit the track events back to the table, potentially re-triggering journeys",
+      (cmd) =>
+        cmd.options({
+          sql: {
+            type: "string",
+            alias: "s",
+            require: true,
+            describe: "The SQL query to execute against ClickHouse",
+          },
+        }),
+      async ({ sql }) => {
+        logger().info(
+          {
+            sql,
+          },
+          "Executing custom SQL query and resubmitting events",
+        );
+
+        // Execute the custom SQL query
+        const resultSet = await clickhouseClient().query({
+          query: sql,
+          format: "JSONEachRow",
+        });
+
+        const results = await resultSet.json<unknown>();
+
+        logger().info(
+          {
+            eventCount: results.length,
+          },
+          "Found events, preparing to resubmit",
+        );
+
+        const validationResult = schemaValidateWithErr(
+          results,
+          Type.Array(
+            Type.Composite([
+              Type.Omit(UserEvent, [
+                "message_id",
+                "message_raw",
+                "processing_time",
+                "anonymous_id",
+                "user_or_anonymous_id",
+              ]),
+              Type.Object({
+                properties: Type.Optional(Type.String()),
+                context: Type.Optional(Type.String()),
+              }),
+            ]),
+          ),
+        );
+        if (validationResult.isErr()) {
+          logger().error({ err: validationResult.error }, "Invalid events");
+          return;
+        }
+        if (results.length === 0) {
+          logger().info("No events found for the given query");
+          return;
+        }
+
+        const trackEvents: (KnownTrackData & { workspaceId: string })[] =
+          validationResult.value.flatMap((event) => {
+            if (event.event_type !== EventType.Track) {
+              logger().info(
+                { event },
+                "Skipping event because it is not a track event",
+              );
+              return [];
+            }
+            if (!event.user_id) {
+              logger().info(
+                { event },
+                "Skipping event because it does not have a user id",
+              );
+              return [];
+            }
+            return {
+              workspaceId: event.workspace_id,
+              event: event.event,
+              userId: event.user_id,
+              messageId: randomUUID(),
+              timestamp: event.event_time,
+              context: event.context ? JSON.parse(event.context) : undefined,
+              properties: event.properties
+                ? JSON.parse(event.properties)
+                : undefined,
+            };
+          });
+        await Promise.all(
+          trackEvents.map(({ workspaceId, ...event }) =>
+            submitTrackWithTriggers({
+              workspaceId,
+              data: event,
+            }),
+          ),
+        );
+        logger().info("Done.");
+      },
+    )
+    .command(
+      "export-user-events",
+      "Copy user events from a source to a destination ClickHouse instance.",
+      (cmd) =>
+        cmd.options({
+          "source-clickhouse-host": { type: "string", demandOption: true },
+          "source-clickhouse-port": { type: "number" },
+          "source-clickhouse-database": { type: "string", demandOption: true },
+          "source-clickhouse-user": { type: "string", demandOption: true },
+          "source-clickhouse-password": { type: "string", demandOption: true },
+          "destination-clickhouse-host": { type: "string", demandOption: true },
+          "destination-clickhouse-port": { type: "number" },
+          "destination-clickhouse-database": {
+            type: "string",
+            demandOption: true,
+          },
+          "destination-clickhouse-user": { type: "string", demandOption: true },
+          "destination-clickhouse-password": {
+            type: "string",
+            demandOption: true,
+          },
+          "batch-size": { type: "number", default: 1000 },
+        }),
+      async ({
+        sourceClickhouseHost,
+        sourceClickhousePort,
+        sourceClickhouseDatabase,
+        sourceClickhouseUser,
+        sourceClickhousePassword,
+        destinationClickhouseHost,
+        destinationClickhousePort,
+        destinationClickhouseDatabase,
+        destinationClickhouseUser,
+        destinationClickhousePassword,
+        batchSize,
+      }) => {
+        const sourceClient = createClickhouseClient({
+          host: sourceClickhousePort
+            ? `http://${sourceClickhouseHost}:${sourceClickhousePort}`
+            : sourceClickhouseHost,
+          database: sourceClickhouseDatabase,
+          user: sourceClickhouseUser,
+          password: sourceClickhousePassword,
+        });
+
+        const destinationClient = createClickhouseClient({
+          host: destinationClickhousePort
+            ? `http://${destinationClickhouseHost}:${destinationClickhousePort}`
+            : destinationClickhouseHost,
+          database: destinationClickhouseDatabase,
+          user: destinationClickhouseUser,
+          password: destinationClickhousePassword,
+        });
+
+        let cursor: UserEventV2 | null = null;
+        let totalCopied = 0;
+
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          let queryText: string;
+          const queryParams: Record<string, unknown> = {
+            batchSize,
+          };
+
+          if (cursor) {
+            logger().info(
+              {
+                cursor,
+                batchSize,
+              },
+              "Fetching events from cursor",
+            );
+            queryText = `
+              SELECT *
+              FROM user_events_v2
+              WHERE (workspace_id, processing_time, user_or_anonymous_id, event_time, message_id) > ({workspace_id:String}, {processing_time:DateTime64(3)}, {user_or_anonymous_id:String}, {event_time:DateTime64}, {message_id:String})
+              ORDER BY workspace_id, processing_time, user_or_anonymous_id, event_time, message_id
+              LIMIT {batchSize:UInt64}
+            `;
+            queryParams.workspace_id = cursor.workspace_id;
+            queryParams.processing_time = cursor.processing_time;
+            queryParams.user_or_anonymous_id = cursor.user_or_anonymous_id;
+            queryParams.event_time = cursor.event_time;
+            queryParams.message_id = cursor.message_id;
+          } else {
+            logger().info(
+              {
+                batchSize,
+              },
+              "Fetching initial batch of events",
+            );
+            queryText = `
+              SELECT *
+              FROM user_events_v2
+              ORDER BY workspace_id, processing_time, user_or_anonymous_id, event_time, message_id
+              LIMIT {batchSize:UInt64}
+            `;
+          }
+
+          const resultSet = await sourceClient.query({
+            query: queryText,
+            query_params: queryParams,
+            format: "JSONEachRow",
+          });
+
+          const events = await resultSet.json<UserEventV2>();
+
+          if (events.length === 0) {
+            logger().info("No more events to copy.");
+            break;
+          }
+
+          logger().info(
+            {
+              eventsLength: events.length,
+            },
+            "Inserting events",
+          );
+
+          await destinationClient.insert({
+            table: "user_events_v2",
+            values: events,
+            format: "JSONEachRow",
+          });
+
+          const lastEvent = events[events.length - 1];
+          if (lastEvent) {
+            cursor = lastEvent;
+          }
+
+          totalCopied += events.length;
+
+          logger().info(
+            {
+              eventsLength: events.length,
+              totalCopied,
+            },
+            "Copied events",
+          );
+        }
+
+        logger().info("Event export completed successfully.");
+        await sourceClient.close();
+        await destinationClient.close();
+      },
+    )
+    .command(
+      "get-users",
+      "Get users from a workspace.",
+      (cmd) =>
+        cmd.options({
+          "workspace-id": { type: "string", demandOption: true },
+          "user-ids": { type: "string", array: true },
+          limit: { type: "number", default: 100 },
+          cursor: { type: "string" },
+          "throw-on-error": { type: "boolean", default: false },
+        }),
+      async ({ workspaceId, throwOnError, limit, cursor, userIds }) => {
+        logger().info(
+          {
+            workspaceId,
+          },
+          "Getting users",
+        );
+        const users = await getUsers(
+          { workspaceId, cursor, limit, userIds },
+          { throwOnError },
+        );
+        logger().info(users, "Users");
+      },
+    )
+    .command(
+      "seed-delivery-events",
+      "Seed delivery events for testing analysis charts.",
+      (cmd) =>
+        cmd.options({
+          "workspace-id": { type: "string", alias: "w", demandOption: false },
+          scenario: {
+            type: "string",
+            alias: "s",
+            default: "basic-email",
+            choices: ["basic-email"],
+            describe: "The scenario to seed",
+          },
+        }),
+      async ({ workspaceId: inputWorkspaceId, scenario }) => {
+        // Resolve workspace ID
+        let workspaceId = inputWorkspaceId;
+        if (!workspaceId) {
+          if (backendConfig().nodeEnv !== NodeEnvEnum.Development) {
+            throw new Error(
+              "workspace-id is required in non-development environments",
+            );
+          }
+
+          const defaultWorkspace = await db().query.workspace.findFirst({
+            where: eq(schema.workspace.name, "Default"),
+          });
+
+          if (!defaultWorkspace) {
+            throw new Error(
+              "No workspace with name 'Default' found in development environment",
+            );
+          }
+
+          workspaceId = defaultWorkspace.id;
+          logger().info(
+            { workspaceId },
+            "Using Default workspace for development",
+          );
+        }
+
+        logger().info(
+          {
+            workspaceId,
+            scenario,
+          },
+          "Seeding delivery events",
+        );
+
+        switch (scenario) {
+          case "basic-email": {
+            const templateId = randomUUID();
+            const journeyId = randomUUID();
+            const nodeId = randomUUID();
+            const runId = randomUUID();
+            const baseTime = Date.now();
+
+            // Create 10 users
+            const userIds = Array.from({ length: 10 }, () => randomUUID());
+            const events: BatchItem[] = [];
+
+            // Create 10 message sent events - one for each user
+            userIds.forEach((userId, index) => {
+              const messageId = randomUUID();
+              const userEmail = `user${index + 1}@example.com`;
+
+              events.push({
+                userId,
+                timestamp: new Date(
+                  baseTime - (10 - index) * 30000,
+                ).toISOString(), // 30 seconds apart
+                type: EventType.Track,
+                messageId,
+                event: InternalEventType.MessageSent,
+                properties: {
+                  workspaceId,
+                  journeyId,
+                  nodeId,
+                  runId,
+                  templateId,
+                  messageId,
+                  variant: {
+                    type: ChannelType.Email,
+                    from: "system@example.com",
+                    to: userEmail,
+                    subject: `Welcome Message`,
+                    body: `<h1>Welcome!</h1><p>This is your welcome message</p>`,
+                    provider: {
+                      type: EmailProviderType.SendGrid,
+                    },
+                  },
+                },
+              });
+            });
+
+            // User 0: spam report
+            const user0 = userIds[0];
+            if (user0) {
+              events.push({
+                userId: user0,
+                timestamp: new Date(baseTime - 9 * 30000 + 60000).toISOString(), // 1 minute after send
+                type: EventType.Track,
+                messageId: randomUUID(),
+                event: InternalEventType.EmailMarkedSpam,
+                properties: {
+                  workspaceId,
+                  journeyId,
+                  nodeId,
+                  runId,
+                  templateId,
+                  messageId: events[0]?.messageId, // Reference the sent message
+                },
+              });
+            }
+
+            // User 1: bounce
+            const user1 = userIds[1];
+            if (user1) {
+              events.push({
+                userId: user1,
+                timestamp: new Date(baseTime - 8 * 30000 + 15000).toISOString(), // 15 seconds after send
+                type: EventType.Track,
+                messageId: randomUUID(),
+                event: InternalEventType.EmailBounced,
+                properties: {
+                  workspaceId,
+                  journeyId,
+                  nodeId,
+                  runId,
+                  templateId,
+                  messageId: events[1]?.messageId, // Reference the sent message
+                  reason: "hard_bounce",
+                },
+              });
+            }
+
+            // Users 2, 3, 4: delivered and open but no click
+            for (let i = 2; i <= 4; i++) {
+              const userId = userIds[i];
+              if (userId) {
+                // Delivery event first
+                events.push({
+                  userId,
+                  timestamp: new Date(
+                    baseTime - (10 - i) * 30000 + 30000,
+                  ).toISOString(), // 30 seconds after send
+                  type: EventType.Track,
+                  messageId: randomUUID(),
+                  event: InternalEventType.EmailDelivered,
+                  properties: {
+                    workspaceId,
+                    journeyId,
+                    nodeId,
+                    runId,
+                    templateId,
+                    messageId: events[i]?.messageId, // Reference the sent message
+                  },
+                });
+
+                // Open event
+                events.push({
+                  userId,
+                  timestamp: new Date(
+                    baseTime - (10 - i) * 30000 + 45000,
+                  ).toISOString(), // 45 seconds after send
+                  type: EventType.Track,
+                  messageId: randomUUID(),
+                  event: InternalEventType.EmailOpened,
+                  properties: {
+                    workspaceId,
+                    journeyId,
+                    nodeId,
+                    runId,
+                    templateId,
+                    messageId: events[i]?.messageId, // Reference the sent message
+                  },
+                });
+              }
+            }
+
+            // Users 5, 6: delivered, open and click
+            for (let i = 5; i <= 6; i++) {
+              const userId = userIds[i];
+              if (userId) {
+                // Delivery event first
+                events.push({
+                  userId,
+                  timestamp: new Date(
+                    baseTime - (10 - i) * 30000 + 30000,
+                  ).toISOString(), // 30 seconds after send
+                  type: EventType.Track,
+                  messageId: randomUUID(),
+                  event: InternalEventType.EmailDelivered,
+                  properties: {
+                    workspaceId,
+                    journeyId,
+                    nodeId,
+                    runId,
+                    templateId,
+                    messageId: events[i]?.messageId, // Reference the sent message
+                  },
+                });
+
+                // Open event
+                events.push({
+                  userId,
+                  timestamp: new Date(
+                    baseTime - (10 - i) * 30000 + 45000,
+                  ).toISOString(), // 45 seconds after send
+                  type: EventType.Track,
+                  messageId: randomUUID(),
+                  event: InternalEventType.EmailOpened,
+                  properties: {
+                    workspaceId,
+                    journeyId,
+                    nodeId,
+                    runId,
+                    templateId,
+                    messageId: events[i]?.messageId, // Reference the sent message
+                  },
+                });
+
+                // Click event
+                events.push({
+                  userId,
+                  timestamp: new Date(
+                    baseTime - (10 - i) * 30000 + 90000,
+                  ).toISOString(), // 90 seconds after send
+                  type: EventType.Track,
+                  messageId: randomUUID(),
+                  event: InternalEventType.EmailClicked,
+                  properties: {
+                    workspaceId,
+                    journeyId,
+                    nodeId,
+                    runId,
+                    templateId,
+                    messageId: events[i]?.messageId, // Reference the sent message
+                    link: "https://example.com/clicked-link",
+                  },
+                });
+              }
+            }
+
+            // Users 7, 8, 9: no additional events beyond send
+
+            logger().info(
+              {
+                eventsCount: events.length,
+                userCount: userIds.length,
+                journeyId,
+                templateId,
+                breakdown: {
+                  sent: 10,
+                  delivered: 5, // Users 2,3,4,5,6 have delivery events
+                  spam: 1,
+                  bounce: 1,
+                  openOnly: 3, // Users 2,3,4 have open (and delivery) but no click
+                  openAndClick: 2, // Users 5,6 have open, click (and delivery)
+                  sentOnly: 3, // Users 7,8,9 have only sent events
+                },
+              },
+              "Created events for basic-email scenario",
+            );
+
+            // Submit events individually with specific processing times to spread them across time buckets
+            for (const event of events) {
+              const eventTimestamp = event.timestamp
+                ? new Date(event.timestamp).getTime()
+                : undefined;
+              await submitBatch(
+                {
+                  workspaceId,
+                  data: {
+                    batch: [event],
+                  },
+                },
+                {
+                  processingTime: eventTimestamp,
+                },
+              );
+            }
+
+            logger().info("Successfully seeded delivery events");
+            break;
+          }
+          default:
+            throw new Error(`Unknown scenario: ${scenario}`);
+        }
       },
     );
 }

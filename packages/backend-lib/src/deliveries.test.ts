@@ -1,6 +1,6 @@
 import { randomUUID } from "crypto";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
-import { times } from "remeda";
+import { pick, times } from "remeda";
 
 import { submitBatch } from "./apps/batch";
 import {
@@ -9,6 +9,7 @@ import {
   searchDeliveries,
   SearchDeliveryRow,
 } from "./deliveries";
+import logger from "./logger";
 import {
   BatchItem,
   ChannelType,
@@ -338,6 +339,318 @@ describe("deliveries", () => {
         expect(returnedMessageIds).toContain(triggeredMessageId1);
         expect(returnedMessageIds).toContain(triggeredMessageId4);
       });
+
+      it("matches individual items within array properties", async () => {
+        userId = randomUUID();
+        triggeringMessageId1 = randomUUID();
+        triggeringMessageId2 = randomUUID();
+        triggeredMessageId1 = randomUUID();
+        triggeredMessageId2 = randomUUID();
+
+        const triggeringEventBase: Pick<
+          KnownBatchTrackData,
+          "userId" | "timestamp" | "type" | "event" | "properties"
+        > = {
+          userId,
+          timestamp: new Date(Date.now() - 10000).toISOString(),
+          type: EventType.Track,
+          event: "ARRAY_TEST_EVENT",
+          properties: {
+            workspaceId,
+          },
+        };
+
+        const triggeredEventBase: Pick<
+          KnownBatchTrackData,
+          "userId" | "timestamp" | "type" | "event" | "properties"
+        > = {
+          userId,
+          timestamp: new Date().toISOString(),
+          type: EventType.Track,
+          event: InternalEventType.MessageSent,
+          properties: {
+            workspaceId,
+            journeyId: randomUUID(),
+            nodeId: randomUUID(),
+            runId: randomUUID(),
+            templateId: randomUUID(),
+            variant: {
+              type: ChannelType.Email,
+              from: "test@email.com",
+              to: "user@email.com",
+              subject: "test",
+              body: "test",
+              provider: { type: EmailProviderType.SendGrid },
+            },
+          },
+        };
+
+        const events: BatchItem[] = [
+          // Triggering event 1: Has array property with matching value
+          {
+            ...triggeringEventBase,
+            messageId: triggeringMessageId1,
+            properties: {
+              ...triggeringEventBase.properties,
+              students: [1, 2, 3],
+              course: "math",
+            },
+          },
+          // Triggering event 2: Has array property without matching value
+          {
+            ...triggeringEventBase,
+            messageId: triggeringMessageId2,
+            properties: {
+              ...triggeringEventBase.properties,
+              students: [4, 5, 6],
+              course: "science",
+            },
+          },
+          // Triggered event 1: Should match because triggering event has array containing 2
+          {
+            ...triggeredEventBase,
+            messageId: triggeredMessageId1,
+            properties: {
+              ...triggeredEventBase.properties,
+              messageId: triggeredMessageId1,
+              triggeringMessageId: triggeringMessageId1,
+            },
+          },
+          // Triggered event 2: Should not match because triggering event array doesn't contain 2
+          {
+            ...triggeredEventBase,
+            messageId: triggeredMessageId2,
+            properties: {
+              ...triggeredEventBase.properties,
+              messageId: triggeredMessageId2,
+              triggeringMessageId: triggeringMessageId2,
+            },
+          },
+        ];
+
+        await submitBatch({
+          workspaceId,
+          data: {
+            batch: events,
+          },
+        });
+
+        let deliveries = await searchDeliveries({
+          workspaceId,
+          triggeringProperties: [{ key: "students", value: 2 }],
+          limit: 10,
+        });
+
+        expect(deliveries.items).toHaveLength(1);
+        expect(deliveries.items[0]?.triggeringMessageId).toEqual(
+          triggeringMessageId1,
+        );
+        expect(deliveries.items[0]?.originMessageId).toEqual(
+          triggeredMessageId1,
+        );
+
+        // FIXME why not failing?
+        deliveries = await searchDeliveries({
+          workspaceId,
+          triggeringProperties: [{ key: "students", value: "2" }],
+          limit: 10,
+        });
+
+        expect(deliveries.items, "should also match string value").toHaveLength(
+          1,
+        );
+        expect(deliveries.items[0]?.triggeringMessageId).toEqual(
+          triggeringMessageId1,
+        );
+        expect(deliveries.items[0]?.originMessageId).toEqual(
+          triggeredMessageId1,
+        );
+      });
+
+      it("matches numeric array when filter value is a string for triggeringProperties (studentIds)", async () => {
+        const userIdLocal = randomUUID();
+        const triggeringMessageIdLocal = randomUUID();
+        const triggeredMessageIdLocal = randomUUID();
+
+        const messageSentEvent: Omit<MessageSendSuccess, "type"> = {
+          variant: {
+            type: ChannelType.Email,
+            from: "test-from@email.com",
+            to: "test-to@email.com",
+            body: "body",
+            subject: "subject",
+            provider: { type: EmailProviderType.SendGrid },
+          },
+        };
+
+        const events: BatchItem[] = [
+          // Triggering event with numeric array
+          {
+            userId: userIdLocal,
+            timestamp: new Date(Date.now() - 1000).toISOString(),
+            type: EventType.Track,
+            messageId: triggeringMessageIdLocal,
+            event: "USER_TRIGGERED_STUDENT_EVENT",
+            properties: {
+              workspaceId,
+              studentIds: [741207],
+            },
+          },
+          // Triggered delivery referencing the triggering event
+          {
+            userId: userIdLocal,
+            timestamp: new Date().toISOString(),
+            type: EventType.Track,
+            messageId: triggeredMessageIdLocal,
+            event: InternalEventType.MessageSent,
+            properties: {
+              workspaceId,
+              templateId: randomUUID(),
+              messageId: triggeredMessageIdLocal,
+              triggeringMessageId: triggeringMessageIdLocal,
+              ...messageSentEvent,
+            },
+          },
+        ];
+
+        await submitBatch({
+          workspaceId,
+          data: { batch: events },
+        });
+
+        const deliveries = await searchDeliveries({
+          workspaceId,
+          triggeringProperties: [{ key: "studentIds", value: "741207" }],
+          limit: 10,
+        });
+
+        expect(deliveries.items).toHaveLength(1);
+        expect(deliveries.items[0]?.triggeringMessageId).toEqual(
+          triggeringMessageIdLocal,
+        );
+        expect(deliveries.items[0]?.originMessageId).toEqual(
+          triggeredMessageIdLocal,
+        );
+      });
+
+      it("matches numeric scalar when filter value is a string for triggeringProperties (studentId)", async () => {
+        const userIdLocal = randomUUID();
+        const triggeringMessageIdLocal = randomUUID();
+        const triggeredMessageIdLocal = randomUUID();
+
+        const messageSentEvent: Omit<MessageSendSuccess, "type"> = {
+          variant: {
+            type: ChannelType.Email,
+            from: "test-from@email.com",
+            to: "test-to@email.com",
+            body: "body",
+            subject: "subject",
+            provider: { type: EmailProviderType.SendGrid },
+          },
+        };
+
+        const events: BatchItem[] = [
+          // Triggering event with numeric scalar
+          {
+            userId: userIdLocal,
+            timestamp: new Date(Date.now() - 1000).toISOString(),
+            type: EventType.Track,
+            messageId: triggeringMessageIdLocal,
+            event: "USER_TRIGGERED_STUDENT_EVENT",
+            properties: {
+              workspaceId,
+              studentId: 741207,
+            },
+          },
+          // Triggered delivery referencing the triggering event
+          {
+            userId: userIdLocal,
+            timestamp: new Date().toISOString(),
+            type: EventType.Track,
+            messageId: triggeredMessageIdLocal,
+            event: InternalEventType.MessageSent,
+            properties: {
+              workspaceId,
+              templateId: randomUUID(),
+              messageId: triggeredMessageIdLocal,
+              triggeringMessageId: triggeringMessageIdLocal,
+              ...messageSentEvent,
+            },
+          },
+        ];
+
+        await submitBatch({
+          workspaceId,
+          data: { batch: events },
+        });
+
+        const deliveries = await searchDeliveries({
+          workspaceId,
+          triggeringProperties: [{ key: "studentId", value: "741207" }],
+          limit: 10,
+        });
+
+        // Expecting a semantic match, but current implementation likely fails
+        expect(deliveries.items).toHaveLength(1);
+        expect(deliveries.items[0]?.triggeringMessageId).toEqual(
+          triggeringMessageIdLocal,
+        );
+        expect(deliveries.items[0]?.originMessageId).toEqual(
+          triggeredMessageIdLocal,
+        );
+      });
+
+      it("does not match context when only triggeringProperties are provided and no triggering_message_id", async () => {
+        const userIdLocal = randomUUID();
+        const messageIdLocal = randomUUID();
+
+        const messageSentEvent: Omit<MessageSendSuccess, "type"> = {
+          variant: {
+            type: ChannelType.Email,
+            from: "test-from@email.com",
+            to: "test-to@email.com",
+            body: "body",
+            subject: "subject",
+            provider: { type: EmailProviderType.SendGrid },
+          },
+        };
+
+        // Create a MessageSent without triggeringMessageId, but with matching context
+        const events: BatchItem[] = [
+          {
+            userId: userIdLocal,
+            timestamp: new Date().toISOString(),
+            type: EventType.Track,
+            messageId: messageIdLocal,
+            event: InternalEventType.MessageSent,
+            context: {
+              studentIds: [741207],
+            },
+            properties: {
+              workspaceId,
+              templateId: randomUUID(),
+              messageId: messageIdLocal,
+              // NOTE: intentionally no triggeringMessageId
+              ...messageSentEvent,
+            },
+          },
+        ];
+
+        await submitBatch({
+          workspaceId,
+          data: { batch: events },
+        });
+
+        // User filters by triggeringProperties only. We should NOT match context; a join to the
+        // triggering event is required to match triggering properties, and it's missing here.
+        const deliveries = await searchDeliveries({
+          workspaceId,
+          triggeringProperties: [{ key: "studentIds", value: "741207" }],
+          limit: 10,
+        });
+
+        expect(deliveries.items).toHaveLength(0);
+      });
     });
 
     describe("with anonymous users", () => {
@@ -535,7 +848,12 @@ describe("deliveries", () => {
             event: InternalEventType.MessageSent,
             messageId: messageId1,
             properties: {
-              ...node1Properties,
+              ...pick(node1Properties, [
+                "journeyId",
+                "nodeId",
+                "templateId",
+                "runId",
+              ]),
               ...messageSentEvent1,
             },
           }),
@@ -554,7 +872,12 @@ describe("deliveries", () => {
             event: InternalEventType.MessageSent,
             messageId: messageId2,
             properties: {
-              ...node2Properties,
+              ...pick(node2Properties, [
+                "journeyId",
+                "nodeId",
+                "templateId",
+                "runId",
+              ]),
               ...messageSentEvent2,
             },
           }),
@@ -569,11 +892,17 @@ describe("deliveries", () => {
             event: InternalEventType.MessageSent,
             messageId: messageId3,
             properties: {
-              ...node3Properties,
+              ...pick(node3Properties, [
+                "journeyId",
+                "nodeId",
+                "templateId",
+                "runId",
+              ]),
               ...messageSentEvent3,
             },
           }),
         ];
+        logger().info({ events }, "events");
 
         await submitBatch({
           workspaceId,
@@ -1611,6 +1940,363 @@ describe("deliveries", () => {
         expect(deliveries.cursor).toBeUndefined();
       });
     });
+
+    describe("when filtering by context values using batchMessageUsers", () => {
+      let templateId: string;
+
+      beforeEach(() => {
+        templateId = randomUUID();
+      });
+
+      it("should filter deliveries by context values", async () => {
+        const userId1 = randomUUID();
+        const userId2 = randomUUID();
+        const userId3 = randomUUID();
+
+        const messageSentEvent: Omit<MessageSendSuccess, "type"> = {
+          variant: {
+            type: ChannelType.Email,
+            from: "test-from@email.com",
+            to: "test-to@email.com",
+            body: "body",
+            subject: "subject",
+            provider: {
+              type: EmailProviderType.SendGrid,
+            },
+          },
+        };
+
+        // Create MessageSent events with different context values directly
+        const events: BatchItem[] = [
+          {
+            userId: userId1,
+            timestamp: new Date().toISOString(),
+            type: EventType.Track,
+            messageId: randomUUID(),
+            event: InternalEventType.MessageSent,
+            context: {
+              source: "website",
+              campaign: "spring-sale",
+            },
+            properties: {
+              workspaceId,
+              templateId,
+              messageId: randomUUID(),
+              ...messageSentEvent,
+            },
+          },
+          {
+            userId: userId2,
+            timestamp: new Date().toISOString(),
+            type: EventType.Track,
+            messageId: randomUUID(),
+            event: InternalEventType.MessageSent,
+            context: {
+              source: "mobile-app",
+              region: "us-west",
+            },
+            properties: {
+              workspaceId,
+              templateId,
+              messageId: randomUUID(),
+              ...messageSentEvent,
+            },
+          },
+          {
+            userId: userId3,
+            timestamp: new Date().toISOString(),
+            type: EventType.Track,
+            messageId: randomUUID(),
+            event: InternalEventType.MessageSent,
+            context: {
+              campaign: "summer-sale",
+              region: "us-west",
+            },
+            properties: {
+              workspaceId,
+              templateId,
+              messageId: randomUUID(),
+              ...messageSentEvent,
+            },
+          },
+        ];
+
+        await submitBatch({
+          workspaceId,
+          data: {
+            batch: events,
+          },
+        });
+
+        // Test filtering by context values that exist
+        const springCampaignResults = await searchDeliveries({
+          workspaceId,
+          contextValues: [
+            {
+              key: "campaign",
+              value: "spring-sale",
+            },
+          ],
+        });
+
+        expect(springCampaignResults.items).toHaveLength(1);
+        // Should find the delivery for userId1 who has spring-sale campaign
+
+        const websiteSourceResults = await searchDeliveries({
+          workspaceId,
+          contextValues: [
+            {
+              key: "source",
+              value: "website",
+            },
+          ],
+        });
+
+        expect(websiteSourceResults.items).toHaveLength(1);
+        // Should find the delivery for userId1 who has website source
+
+        const regionResults = await searchDeliveries({
+          workspaceId,
+          contextValues: [
+            {
+              key: "region",
+              value: "us-west",
+            },
+          ],
+        });
+
+        expect(regionResults.items).toHaveLength(2);
+        // Should find deliveries for userId2 and userId3 who inherited the batch region
+
+        // Test filtering by context values that don't exist
+        const nonExistentResults = await searchDeliveries({
+          workspaceId,
+          contextValues: [
+            {
+              key: "nonexistent",
+              value: "value",
+            },
+          ],
+        });
+
+        expect(nonExistentResults.items).toHaveLength(0);
+
+        // Test filtering by multiple context values (AND logic)
+        const multipleContextResults = await searchDeliveries({
+          workspaceId,
+          contextValues: [
+            {
+              key: "source",
+              value: "mobile-app",
+            },
+            {
+              key: "region",
+              value: "us-west",
+            },
+          ],
+        });
+
+        expect(multipleContextResults.items).toHaveLength(1);
+        // Should find the delivery for userId2 who has mobile-app source and inherited us-west region
+      });
+
+      it("should combine contextValues and triggeringProperties with OR logic", async () => {
+        const userId1 = randomUUID();
+        const triggeringMessageId = randomUUID();
+
+        const messageSentEvent: Omit<MessageSendSuccess, "type"> = {
+          variant: {
+            type: ChannelType.Email,
+            from: "test-from@email.com",
+            to: "test-to@email.com",
+            body: "body",
+            subject: "subject",
+            provider: {
+              type: EmailProviderType.SendGrid,
+            },
+          },
+        };
+
+        // Create a triggering event and a MessageSent event with context
+        const events: BatchItem[] = [
+          // Triggering event with properties that won't match
+          {
+            userId: userId1,
+            timestamp: new Date(Date.now() - 1000).toISOString(),
+            type: EventType.Track,
+            messageId: triggeringMessageId,
+            event: "some-triggering-event",
+            properties: {
+              workspaceId,
+              differentProp: "different-value",
+            },
+          },
+          // MessageSent event with context
+          {
+            userId: userId1,
+            timestamp: new Date().toISOString(),
+            type: EventType.Track,
+            messageId: randomUUID(),
+            event: InternalEventType.MessageSent,
+            context: {
+              source: "website",
+            },
+            properties: {
+              workspaceId,
+              templateId,
+              messageId: randomUUID(),
+              triggeringMessageId,
+              ...messageSentEvent,
+            },
+          },
+        ];
+
+        await submitBatch({
+          workspaceId,
+          data: {
+            batch: events,
+          },
+        });
+
+        // Test that both contextValues and triggeringProperties work with OR logic
+        const combinedResults = await searchDeliveries({
+          workspaceId,
+          contextValues: [
+            {
+              key: "source",
+              value: "website",
+            },
+          ],
+          triggeringProperties: [
+            {
+              key: "nonexistent",
+              value: "value",
+            },
+          ],
+        });
+
+        expect(combinedResults.items).toHaveLength(1);
+        // Should find the delivery because contextValues match (OR logic)
+
+        const noMatchResults = await searchDeliveries({
+          workspaceId,
+          contextValues: [
+            {
+              key: "nonexistent1",
+              value: "value1",
+            },
+          ],
+          triggeringProperties: [
+            {
+              key: "nonexistent2",
+              value: "value2",
+            },
+          ],
+        });
+
+        expect(noMatchResults.items).toHaveLength(0);
+        // Should find no deliveries because neither condition matches
+      });
+
+      it("matches numeric array when filter value is a string for contextValues (studentIds)", async () => {
+        const userIdLocal = randomUUID();
+        const messageIdLocal = randomUUID();
+
+        const messageSentEvent: Omit<MessageSendSuccess, "type"> = {
+          variant: {
+            type: ChannelType.Email,
+            from: "test-from@email.com",
+            to: "test-to@email.com",
+            body: "body",
+            subject: "subject",
+            provider: { type: EmailProviderType.SendGrid },
+          },
+        };
+
+        const events: BatchItem[] = [
+          {
+            userId: userIdLocal,
+            timestamp: new Date().toISOString(),
+            type: EventType.Track,
+            messageId: messageIdLocal,
+            event: InternalEventType.MessageSent,
+            context: {
+              studentIds: [741207],
+            },
+            properties: {
+              workspaceId,
+              templateId: randomUUID(),
+              messageId: messageIdLocal,
+              ...messageSentEvent,
+            },
+          },
+        ];
+
+        await submitBatch({
+          workspaceId,
+          data: { batch: events },
+        });
+
+        const deliveries = await searchDeliveries({
+          workspaceId,
+          contextValues: [{ key: "studentIds", value: "741207" }],
+          limit: 10,
+        });
+
+        expect(deliveries.items).toHaveLength(1);
+        expect(deliveries.items[0]?.originMessageId).toEqual(messageIdLocal);
+      });
+
+      it("matches numeric scalar when filter value is a string for contextValues (studentId)", async () => {
+        const userIdLocal = randomUUID();
+        const messageIdLocal = randomUUID();
+
+        const messageSentEvent: Omit<MessageSendSuccess, "type"> = {
+          variant: {
+            type: ChannelType.Email,
+            from: "test-from@email.com",
+            to: "test-to@email.com",
+            body: "body",
+            subject: "subject",
+            provider: { type: EmailProviderType.SendGrid },
+          },
+        };
+
+        const events: BatchItem[] = [
+          {
+            userId: userIdLocal,
+            timestamp: new Date().toISOString(),
+            type: EventType.Track,
+            messageId: messageIdLocal,
+            event: InternalEventType.MessageSent,
+            context: {
+              studentId: 741207,
+            },
+            properties: {
+              workspaceId,
+              templateId: randomUUID(),
+              messageId: messageIdLocal,
+              ...messageSentEvent,
+            },
+          },
+        ];
+
+        await submitBatch({
+          workspaceId,
+          data: { batch: events },
+        });
+
+        const deliveries = await searchDeliveries({
+          workspaceId,
+          contextValues: [{ key: "studentId", value: "741207" }],
+          limit: 10,
+        });
+
+        // Expecting a semantic match, but current implementation likely fails
+        expect(deliveries.items).toHaveLength(1);
+        expect(deliveries.items[0]?.originMessageId).toEqual(messageIdLocal);
+      });
+    });
   });
   describe("parseSearchDeliveryRow", () => {
     it("accepts either messageType or channel", () => {
@@ -1889,6 +2575,90 @@ describe("deliveries", () => {
         });
 
         expect(result).toEqual(expectedVariant);
+      });
+    });
+
+    describe("when filtering by both triggeringMessageId and messageId with OR condition", () => {
+      let triggeringMessageId: string;
+      let messageId: string;
+      let expectedVariant1: MessageSendSuccessVariant;
+      let expectedVariant2: MessageSendSuccessVariant;
+
+      beforeEach(async () => {
+        triggeringMessageId = randomUUID();
+        messageId = randomUUID();
+        expectedVariant1 = {
+          type: ChannelType.Email,
+          from: "test-from@email.com",
+          to: "test-to@email.com",
+          body: "triggering message body",
+          subject: "triggering subject",
+          provider: {
+            type: EmailProviderType.SendGrid,
+          },
+        };
+        expectedVariant2 = {
+          type: ChannelType.Email,
+          from: "test-from@email.com",
+          to: "test-to@email.com",
+          body: "message id body",
+          subject: "message id subject",
+          provider: {
+            type: EmailProviderType.SendGrid,
+          },
+        };
+
+        const event1: BatchItem = {
+          userId,
+          timestamp: new Date(Date.now() - 1000).toISOString(),
+          type: EventType.Track,
+          messageId: randomUUID(),
+          event: InternalEventType.MessageSent,
+          properties: {
+            workspaceId,
+            journeyId: randomUUID(),
+            nodeId: randomUUID(),
+            runId: randomUUID(),
+            templateId: randomUUID(),
+            triggeringMessageId,
+            variant: expectedVariant1,
+          },
+        };
+
+        const event2: BatchItem = {
+          userId,
+          timestamp: new Date().toISOString(),
+          type: EventType.Track,
+          messageId,
+          event: InternalEventType.MessageSent,
+          properties: {
+            workspaceId,
+            journeyId: randomUUID(),
+            nodeId: randomUUID(),
+            runId: randomUUID(),
+            templateId: randomUUID(),
+            variant: expectedVariant2,
+          },
+        };
+
+        await submitBatch({
+          workspaceId,
+          data: {
+            batch: [event1, event2],
+          },
+        });
+      });
+
+      it("returns the most recent delivery when both triggeringMessageId and messageId are provided", async () => {
+        const result = await getDeliveryBody({
+          workspaceId,
+          userId,
+          triggeringMessageId,
+          messageId,
+        });
+
+        // Should return the most recent one (event2 with messageId)
+        expect(result).toEqual(expectedVariant2);
       });
     });
   });

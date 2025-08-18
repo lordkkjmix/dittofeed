@@ -1,5 +1,4 @@
 import { Stack } from "@mui/material";
-import axios from "axios";
 import { db } from "backend-lib/src/db";
 import * as schema from "backend-lib/src/db/schema";
 import logger from "backend-lib/src/logger";
@@ -9,13 +8,10 @@ import {
   updateUserSubscriptions,
 } from "backend-lib/src/subscriptionGroups";
 import { SubscriptionChange } from "backend-lib/src/types";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { UNAUTHORIZED_PAGE } from "isomorphic-lib/src/constants";
 import { schemaValidate } from "isomorphic-lib/src/resultHandling/schemaValidation";
-import {
-  SubscriptionParams,
-  UserSubscriptionsUpdate,
-} from "isomorphic-lib/src/types";
+import { SubscriptionParams } from "isomorphic-lib/src/types";
 import { GetServerSideProps, NextPage } from "next";
 import React from "react";
 
@@ -23,9 +19,12 @@ import {
   SubscriptionManagement,
   SubscriptionManagementProps,
 } from "../../components/subscriptionManagement";
+import { apiBase } from "../../lib/apiBase";
 
 type SSP = Omit<SubscriptionManagementProps, "onSubscriptionUpdate"> & {
   apiBase: string;
+  changedSubscriptionChannel?: string;
+  showAllChannels: boolean;
 };
 export const getServerSideProps: GetServerSideProps<SSP> = async (ctx) => {
   const params = schemaValidate(ctx.query, SubscriptionParams);
@@ -44,33 +43,53 @@ export const getServerSideProps: GetServerSideProps<SSP> = async (ctx) => {
       },
     };
   }
-  const { i, w, h, sub, s, ik } = params.value;
+  const {
+    i,
+    w,
+    h,
+    sub,
+    s,
+    ik,
+    isPreview: isPreviewParam,
+    showAllChannels: showAllChannelsParam,
+  } = params.value;
+  const isPreview = isPreviewParam === "true";
+  const showAllChannels = showAllChannelsParam === "true";
 
   const [userLookupResult, workspace] = await Promise.all([
-    lookupUserForSubscriptions({
-      workspaceId: w,
-      identifier: i,
-      identifierKey: ik,
-      hash: h,
-    }),
+    isPreview
+      ? null
+      : lookupUserForSubscriptions({
+          workspaceId: w,
+          identifier: i,
+          identifierKey: ik,
+          hash: h,
+        }),
     db().query.workspace.findFirst({
       where: eq(schema.workspace.id, w),
     }),
   ]);
 
-  if (userLookupResult.isErr()) {
-    logger().info(
-      {
-        err: userLookupResult.error,
-      },
-      "Failed user lookup",
-    );
-    return {
-      redirect: {
-        destination: UNAUTHORIZED_PAGE,
-        permanent: false,
-      },
-    };
+  let userId: string | undefined;
+  if (userLookupResult) {
+    if (userLookupResult.isErr()) {
+      logger().info(
+        {
+          err: userLookupResult.error,
+        },
+        "Failed user lookup",
+      );
+      return {
+        redirect: {
+          destination: UNAUTHORIZED_PAGE,
+          permanent: false,
+        },
+      };
+    }
+    userId = userLookupResult.value.userId;
+  } else {
+    // handles preview case
+    userId = "123-preview";
   }
 
   if (!workspace) {
@@ -86,34 +105,74 @@ export const getServerSideProps: GetServerSideProps<SSP> = async (ctx) => {
     };
   }
 
-  const { userId } = userLookupResult.value;
-
   let subscriptionChange: SubscriptionChange | undefined;
-  if (s && sub) {
-    logger().debug(
-      {
-        subscriptionId: s,
-        subscriptionChange: sub,
-      },
-      "Subscription change",
-    );
+  let changedSubscriptionChannel: string | undefined;
+  if (s) {
+    // Get the subscription group to determine its channel
+    const targetSubscriptionGroup =
+      await db().query.subscriptionGroup.findFirst({
+        where: eq(schema.subscriptionGroup.id, s),
+      });
 
-    subscriptionChange =
-      sub === "1"
-        ? SubscriptionChange.Subscribe
-        : SubscriptionChange.Unsubscribe;
+    changedSubscriptionChannel = targetSubscriptionGroup?.channel;
 
-    await updateUserSubscriptions({
-      workspaceId: w,
-      userUpdates: [
+    if (sub && !isPreview) {
+      logger().debug(
         {
-          userId,
-          changes: {
-            [s]: sub === "1",
-          },
+          subscriptionId: s,
+          subscriptionChange: sub,
         },
-      ],
-    });
+        "Subscription change",
+      );
+
+      subscriptionChange =
+        sub === "1"
+          ? SubscriptionChange.Subscribe
+          : SubscriptionChange.Unsubscribe;
+
+      if (targetSubscriptionGroup) {
+        // If unsubscribing, unsubscribe from all subscription groups in the same channel
+        if (subscriptionChange === SubscriptionChange.Unsubscribe) {
+          const channelSubscriptionGroups =
+            await db().query.subscriptionGroup.findMany({
+              where: and(
+                eq(schema.subscriptionGroup.workspaceId, w),
+                eq(
+                  schema.subscriptionGroup.channel,
+                  targetSubscriptionGroup.channel,
+                ),
+              ),
+            });
+
+          const channelChanges: Record<string, boolean> = {};
+          channelSubscriptionGroups.forEach((sg) => {
+            channelChanges[sg.id] = false;
+          });
+
+          await updateUserSubscriptions({
+            workspaceId: w,
+            userUpdates: [
+              {
+                userId,
+                changes: channelChanges,
+              },
+            ],
+          });
+        } else {
+          await updateUserSubscriptions({
+            workspaceId: w,
+            userUpdates: [
+              {
+                userId,
+                changes: {
+                  [s]: sub === "1",
+                },
+              },
+            ],
+          });
+        }
+      }
+    }
   }
 
   const subscriptions = await getUserSubscriptions({
@@ -122,13 +181,15 @@ export const getServerSideProps: GetServerSideProps<SSP> = async (ctx) => {
   });
 
   const props: SSP = {
-    apiBase: process.env.DASHBOARD_API_BASE ?? "http://localhost:3001",
+    apiBase: apiBase(),
     subscriptions,
     hash: h,
     identifier: i,
     identifierKey: ik,
     workspaceId: w,
     workspaceName: workspace.name,
+    isPreview,
+    showAllChannels,
   };
   if (subscriptionChange) {
     props.subscriptionChange = subscriptionChange;
@@ -136,34 +197,28 @@ export const getServerSideProps: GetServerSideProps<SSP> = async (ctx) => {
   if (s) {
     props.changedSubscription = s;
   }
+  if (changedSubscriptionChannel) {
+    props.changedSubscriptionChannel = changedSubscriptionChannel;
+  }
 
   return { props };
 };
 
 const SubscriptionManagementPage: NextPage<SSP> =
   function SubscriptionManagementPage(props) {
-    const { apiBase } = props;
-    const onUpdate: SubscriptionManagementProps["onSubscriptionUpdate"] =
-      async (update) => {
-        const data: UserSubscriptionsUpdate = update;
-        await axios({
-          method: "PUT",
-          url: `${apiBase}/api/public/subscription-management/user-subscriptions`,
-          data,
-          headers: {
-            "Content-Type": "application/json",
-          },
-        });
-      };
     const {
+      apiBase: propsApiBase,
       workspaceId,
       subscriptions,
       subscriptionChange,
       changedSubscription,
+      changedSubscriptionChannel,
       hash,
       identifier,
       identifierKey,
       workspaceName,
+      isPreview,
+      showAllChannels,
     } = props;
     return (
       <Stack
@@ -176,11 +231,14 @@ const SubscriptionManagementPage: NextPage<SSP> =
           subscriptions={subscriptions}
           subscriptionChange={subscriptionChange}
           changedSubscription={changedSubscription}
+          changedSubscriptionChannel={changedSubscriptionChannel}
           hash={hash}
           identifier={identifier}
           identifierKey={identifierKey}
           workspaceName={workspaceName}
-          onSubscriptionUpdate={onUpdate}
+          apiBase={propsApiBase}
+          isPreview={isPreview}
+          showAllChannels={showAllChannels}
         />
       </Stack>
     );

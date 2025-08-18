@@ -12,7 +12,7 @@ Dittofeed comes with a number of built-in liquid tags, filters. These are availa
 The `unsubscribe_link` tag outputs a link to unsubscribe from the message's [subscription group](/resources/subscription-groups). 
 
 ```html
-{{ unsubscribe_link }}
+{% unsubscribe_link %}
 ```
 
 This renders a link of the form,
@@ -26,7 +26,7 @@ This tag is only usable in templates used within a [journey message node](resour
 The link's text can also be overridden by passing a parameter to the tag e.g.
 
 ```html
-You can unsubscribe by clicking {{ unsubscribe_link here }}.
+You can unsubscribe by clicking {% unsubscribe_link here %}.
 ```
 
 Including an `unsubscribe_link` is critical for marketing emails, for both legal and user experience reasons. It should be included in the footer of your email, along with your company name, and address e.g.
@@ -42,3 +42,48 @@ Including an `unsubscribe_link` is critical for marketing emails, for both legal
   Powered by <a href="https://dittofeed.com" target="_blank" rel="noopener noreferrer">Dittofeed</a>.
 </mj-text>
 ```
+
+
+### `unsubscribe_url`
+
+If you need to customize the unsubscribe link, you can use the `unsubscribe_url` tag to only output the URL.
+
+```html
+<a class="df-unsubscribe" clicktracking=off href="{% unsubscribe_url %}" target="_blank">unsubscribe</a>
+```
+
+### `subscription_management_link`
+
+The `subscription_management_link` tag outputs a link to the subscription management page without automatically unsubscribing the user. This allows users to manage their subscription preferences manually.
+
+```html
+{% subscription_management_link %}
+```
+
+This renders a link of the form,
+
+```html
+<a class="df-subscription-management" clicktracking=off href="..." target="_blank">manage subscriptions</a>
+```
+
+The link's text can also be overridden by passing a parameter to the tag e.g.
+
+```html
+You can {% subscription_management_link manage your subscription preferences %}.
+```
+
+This tag is useful when you want to provide users with access to subscription management without automatically changing their subscription status upon page load.
+
+#### Channel Display Behavior
+
+The subscription management page accessed via this link will always show subscription groups for all channels, allowing users to comprehensively manage their preferences across email, SMS, and other messaging channels.
+
+### `subscription_management_url`
+
+If you need to customize the subscription management link, you can use the `subscription_management_url` tag to only output the URL.
+
+```html
+<a class="df-subscription-management" clicktracking=off href="{% subscription_management_url %}" target="_blank">manage subscriptions</a>
+```
+
+This tag follows the same channel display behavior as `subscription_management_link` - always showing subscription groups for all channels.

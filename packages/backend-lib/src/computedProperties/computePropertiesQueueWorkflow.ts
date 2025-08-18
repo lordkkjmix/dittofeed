@@ -150,13 +150,14 @@ export async function computePropertiesQueueWorkflow(
     "computePropertiesQueueCapacity",
     "computePropertiesAttempts",
     "computedPropertiesActivityTaskQueue",
+    "computePropertiesTimeout",
   ]);
   const concurrency = initialConfig.computePropertiesQueueConcurrency;
   const capacity = initialConfig.computePropertiesQueueCapacity;
   const maxLoopIterations = initialConfig.computePropertiesAttempts;
 
   const { computePropertiesContainedV2 } = proxyActivities<typeof activities>({
-    startToCloseTimeout: "5 minutes",
+    startToCloseTimeout: initialConfig.computePropertiesTimeout,
     taskQueue: initialConfig.computedPropertiesActivityTaskQueue,
   });
 
@@ -259,8 +260,6 @@ export async function computePropertiesQueueWorkflow(
     // C) Acquire a semaphore slot to respect concurrency
     await semaphore.acquire();
 
-    membership.delete(key);
-
     logger.info("Queue: Acquired semaphore slot", {
       workspaceId,
       key,
@@ -294,6 +293,7 @@ export async function computePropertiesQueueWorkflow(
           err,
         });
       } finally {
+        membership.delete(key);
         inFlight.splice(
           inFlight.findIndex((t) => t.key === key),
           1,

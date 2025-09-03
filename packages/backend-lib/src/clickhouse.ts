@@ -4,6 +4,7 @@ import {
   BaseResultSet,
   ClickHouseClient,
   createClient,
+  InsertResult,
   Row,
 } from "@clickhouse/client";
 import { NodeClickHouseClient } from "@clickhouse/client/dist/client";
@@ -78,6 +79,9 @@ export class ClickHouseQueryBuilder {
           // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
           return `${value}`;
         case "Float64":
+          // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
+          return `${value}`;
+        case "UInt64":
           // eslint-disable-next-line @typescript-eslint/restrict-template-expressions
           return `${value}`;
         default:

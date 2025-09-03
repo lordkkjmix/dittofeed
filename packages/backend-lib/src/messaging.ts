@@ -25,7 +25,7 @@ import { validate as validateUuid } from "uuid";
 
 import { submitBatch } from "./apps/batch";
 import { getObject, storage } from "./blobStorage";
-import { db, queryResult } from "./db";
+import { db, TxQueryError, txQueryResult } from "./db";
 import {
   defaultEmailProvider as dbDefaultEmailProvider,
   defaultSmsProvider as dbDefaultSmsProvider,
@@ -46,10 +46,8 @@ import {
   ResendRequiredData,
   sendMail as sendMailResend,
 } from "./destinations/resend";
-import {
-  SENDGRID_ID_HEADER,
-  sendMail as sendMailSendgrid,
-} from "./destinations/sendgrid";
+import { sendMail as sendMailSendgrid } from "./destinations/sendgrid";
+import { sendSms as sendSmsSignalWire } from "./destinations/signalwire";
 import {
   sendMail as sendMailSmtp,
   SendSmtpMailParams,
@@ -87,6 +85,7 @@ import {
   BatchMessageUsersResult,
   BatchMessageUsersResultTypeEnum,
   ChannelType,
+  EmailContentsType,
   EmailProviderSecret,
   EmailProviderType,
   EmailProviderTypeSchema,
@@ -108,6 +107,8 @@ import {
   NonRetryableMessageSendFailure,
   ParsedWebhookBody,
   Secret,
+  SignalWireSecret,
+  SignalWireSenderOverrideType,
   SmsProvider,
   SmsProviderOverride,
   SmsProviderSecret,
@@ -199,6 +200,26 @@ export async function findMessageTemplate({
   });
 }
 
+function doesRequireDraftReset({
+  priorDefinition,
+  newDefinition,
+}: {
+  priorDefinition: MessageTemplateResourceDefinition;
+  newDefinition: MessageTemplateResourceDefinition;
+}): boolean {
+  if (priorDefinition.type !== newDefinition.type) {
+    return true;
+  }
+  if (
+    newDefinition.type === ChannelType.Email &&
+    priorDefinition.type === ChannelType.Email &&
+    newDefinition.emailContentsType !== priorDefinition.emailContentsType
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export async function upsertMessageTemplate(
   data: UpsertMessageTemplateResource,
 ): Promise<
@@ -210,35 +231,102 @@ export async function upsertMessageTemplate(
       message: "Invalid message template id, must be a valid v4 UUID",
     });
   }
-  const result = await queryResult(
-    db()
-      .insert(dbMessageTemplate)
-      .values({
-        id: data.id,
-        workspaceId: data.workspaceId,
-        name: data.name,
-        definition: data.definition,
-        draft: data.draft,
-        resourceType: data.resourceType,
-      })
-      .onConflictDoUpdate({
-        target: data.id
-          ? [dbMessageTemplate.id]
-          : [dbMessageTemplate.workspaceId, dbMessageTemplate.name],
-        set: {
-          name: data.name,
-          definition: data.definition,
-          draft: data.draft,
-          resourceType: data.resourceType,
-        },
-        setWhere: eq(dbMessageTemplate.workspaceId, data.workspaceId),
-      })
-      .returning(),
-  );
-  if (result.isErr()) {
+  const txResult: Result<MessageTemplate, TxQueryError> =
+    await db().transaction(async (tx) => {
+      const findFirstConditions: SQL[] = [
+        eq(dbMessageTemplate.workspaceId, data.workspaceId),
+      ];
+      if (data.id) {
+        findFirstConditions.push(eq(dbMessageTemplate.id, data.id));
+      } else {
+        findFirstConditions.push(eq(dbMessageTemplate.name, data.name));
+      }
+      const existingTemplate = await tx.query.messageTemplate.findFirst({
+        where: and(...findFirstConditions),
+      });
+      if (!existingTemplate) {
+        const createResult = await txQueryResult(
+          tx
+            .insert(dbMessageTemplate)
+            .values({
+              id: data.id,
+              workspaceId: data.workspaceId,
+              name: data.name,
+              definition: data.definition,
+              draft: data.draft,
+              resourceType: data.resourceType,
+            })
+            .returning(),
+        );
+        if (createResult.isErr()) {
+          return err(createResult.error);
+        }
+        const createdTemplate = createResult.value[0];
+        if (!createdTemplate) {
+          logger().error(
+            {
+              workspaceId: data.workspaceId,
+              name: data.name,
+            },
+            "message template not found",
+          );
+          throw new Error("message template not found");
+        }
+        return ok(createdTemplate);
+      }
+      const existingDefinition = schemaValidateWithErr(
+        existingTemplate.definition,
+        MessageTemplateResourceDefinition,
+      );
+      if (existingDefinition.isErr()) {
+        logger().error(
+          {
+            err: existingDefinition.error,
+            id: existingTemplate.id,
+            workspaceId: data.workspaceId,
+          },
+          "existing message template definition is invalid",
+        );
+        throw new Error("existing message template definition is invalid");
+      }
+      const requiresDraftReset =
+        data.definition !== undefined &&
+        doesRequireDraftReset({
+          priorDefinition: existingDefinition.value,
+          newDefinition: data.definition,
+        });
+      const updateResult = await txQueryResult(
+        tx
+          .update(dbMessageTemplate)
+          .set({
+            name: data.name,
+            definition: data.definition,
+            draft: requiresDraftReset ? null : data.draft,
+            resourceType: data.resourceType,
+          })
+          .where(eq(dbMessageTemplate.id, existingTemplate.id))
+          .returning(),
+      );
+      if (updateResult.isErr()) {
+        return err(updateResult.error);
+      }
+      const updatedTemplate = updateResult.value[0];
+      if (!updatedTemplate) {
+        logger().error(
+          {
+            workspaceId: data.workspaceId,
+            id: existingTemplate.id,
+          },
+          "message template not found",
+        );
+        throw new Error("message template not found");
+      }
+      return ok(updatedTemplate);
+    });
+  if (txResult.isErr()) {
     if (
-      result.error.code === PostgresError.UNIQUE_VIOLATION ||
-      result.error.code === PostgresError.FOREIGN_KEY_VIOLATION
+      txResult.error.code === PostgresError.UNIQUE_VIOLATION ||
+      txResult.error.code === PostgresError.FOREIGN_KEY_VIOLATION
     ) {
       return err({
         type: UpsertMessageTemplateValidationErrorType.UniqueConstraintViolation,
@@ -246,17 +334,19 @@ export async function upsertMessageTemplate(
           "Names must be unique in workspace. Id's must be globally unique.",
       });
     }
-    throw result.error;
+    logger().error(
+      {
+        err: txResult.error,
+        data,
+      },
+      "Failed to upsert message template",
+    );
+    throw new Error(
+      `Failed to upsert message template: code=${txResult.error.code}`,
+    );
   }
 
-  const [messageTemplate] = result.value;
-  if (!messageTemplate) {
-    return err({
-      type: UpsertMessageTemplateValidationErrorType.UniqueConstraintViolation,
-      message:
-        "Names must be unique in workspace. Id's must be globally unique.",
-    });
-  }
+  const messageTemplate = txResult.value;
   return ok(unwrap(enrichMessageTemplate(messageTemplate)));
 }
 
@@ -761,7 +851,9 @@ export async function sendEmail({
   }
   const identifierKey = CHANNEL_IDENTIFIERS[ChannelType.Email];
   let emailBody: string;
-  if ("emailContentsType" in messageTemplateDefinition) {
+  if (
+    messageTemplateDefinition.emailContentsType === EmailContentsType.LowCode
+  ) {
     const mjml = toMjml({
       content: messageTemplateDefinition.body,
       mode: "render",
@@ -1796,23 +1888,27 @@ export async function sendSms(
         });
       }
 
-      let sender: TwilioSender;
-      const { senderOverride } = params;
-      if (providerOverride === SmsProviderType.Twilio && senderOverride) {
-        switch (senderOverride.type) {
+      let senderOverride: TwilioSender | null = null;
+      if (
+        params.providerOverride === SmsProviderType.Twilio &&
+        params.senderOverride
+      ) {
+        switch (params.senderOverride.type) {
           case TwilioSenderOverrideType.MessageSid:
-            sender = {
-              messagingServiceSid: senderOverride.messagingServiceSid,
+            senderOverride = {
+              messagingServiceSid: params.senderOverride.messagingServiceSid,
             };
             break;
           case TwilioSenderOverrideType.PhoneNumber:
-            sender = {
-              from: senderOverride.phone,
+            senderOverride = {
+              from: params.senderOverride.phone,
             };
             break;
-          default:
-            assertUnreachable(senderOverride);
         }
+      }
+      let sender: TwilioSender;
+      if (senderOverride) {
+        sender = senderOverride;
       } else if (messagingServiceSid) {
         sender = {
           messagingServiceSid,
@@ -1862,6 +1958,114 @@ export async function sendSms(
           provider: {
             type: SmsProviderType.Twilio,
             sid: result.value.sid,
+          },
+        },
+      });
+    }
+    case SmsProviderType.SignalWire: {
+      const configResult = schemaValidateWithErr(
+        parsedConfigResult.value,
+        SignalWireSecret,
+      );
+      if (configResult.isErr()) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: configResult.error.message,
+          },
+        });
+      }
+
+      const { project, token, spaceUrl, phone } = configResult.value;
+
+      if (!project) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: `missing project in SignalWire provider config`,
+          },
+        });
+      }
+
+      if (!token) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: `missing token in SignalWire provider config`,
+          },
+        });
+      }
+
+      if (!spaceUrl) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: `missing spaceUrl in SignalWire provider config`,
+          },
+        });
+      }
+
+      let phoneOverride: string | null = null;
+      if (
+        params.providerOverride === SmsProviderType.SignalWire &&
+        params.senderOverride
+      ) {
+        switch (params.senderOverride.type) {
+          case SignalWireSenderOverrideType.PhoneNumber:
+            phoneOverride = params.senderOverride.phone;
+        }
+      }
+      let from: string;
+      if (phoneOverride) {
+        from = phoneOverride;
+      } else if (phone) {
+        from = phone;
+      } else {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message:
+              "SignalWire sender requires a default phone number or a sender override phone number",
+          },
+        });
+      }
+
+      const result = await sendSmsSignalWire({
+        project,
+        token,
+        spaceUrl,
+        body,
+        to,
+        from,
+        tags: messageTags,
+        disableCallback,
+      });
+
+      if (result.isErr()) {
+        return err({
+          type: InternalEventType.MessageFailure,
+          variant: {
+            type: ChannelType.Sms,
+            provider: result.error,
+          },
+        });
+      }
+
+      return ok({
+        type: InternalEventType.MessageSent,
+        variant: {
+          type: ChannelType.Sms,
+          body,
+          to,
+          provider: {
+            type: SmsProviderType.SignalWire,
+            sid: result.value.sid,
+            status: result.value.status,
           },
         },
       });

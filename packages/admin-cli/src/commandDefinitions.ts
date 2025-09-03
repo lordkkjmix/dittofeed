@@ -6,6 +6,7 @@ import { submitBatch } from "backend-lib/src/apps/batch";
 import { bootstrapClickhouse, bootstrapKafka } from "backend-lib/src/bootstrap";
 import {
   clickhouseClient,
+  ClickHouseQueryBuilder,
   createClickhouseClient,
 } from "backend-lib/src/clickhouse";
 import { computeState } from "backend-lib/src/computedProperties/computePropertiesIncremental";
@@ -14,7 +15,7 @@ import {
   getQueueStateQuery,
 } from "backend-lib/src/computedProperties/computePropertiesQueueWorkflow";
 import {
-  resetComputePropertiesWorkflow,
+  resetComputePropertiesWorkflows,
   resetGlobalCron,
   startComputePropertiesWorkflow,
   startComputePropertiesWorkflowGlobal,
@@ -30,8 +31,10 @@ import backendConfig, { SECRETS } from "backend-lib/src/config";
 import { db } from "backend-lib/src/db";
 import * as schema from "backend-lib/src/db/schema";
 import { workspace as dbWorkspace } from "backend-lib/src/db/schema";
+import { buildDeliverySearchQuery } from "backend-lib/src/deliveries";
 import { findBaseDir } from "backend-lib/src/dir";
 import { addFeatures, removeFeatures } from "backend-lib/src/features";
+import { getKeyedUserJourneyWorkflowIdInner } from "backend-lib/src/journeys/userWorkflow";
 import logger from "backend-lib/src/logger";
 import { publicDrizzleMigrate } from "backend-lib/src/migrate";
 import { onboardUser } from "backend-lib/src/onboarding";
@@ -39,6 +42,7 @@ import { findManySegmentResourcesSafe } from "backend-lib/src/segments";
 import connectWorkflowClient from "backend-lib/src/temporal/connectWorkflowClient";
 import { transferResources } from "backend-lib/src/transferResources";
 import { NodeEnvEnum, UserEvent, Workspace } from "backend-lib/src/types";
+import { buildUserEventsQuery } from "backend-lib/src/userEvents";
 import { findAllUserPropertyResources } from "backend-lib/src/userProperties";
 import { deleteAllUsers, getUsers } from "backend-lib/src/users";
 import {
@@ -48,7 +52,7 @@ import {
   tombstoneWorkspace,
 } from "backend-lib/src/workspaces";
 import { randomUUID } from "crypto";
-import { and, eq, inArray, SQL } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import fs from "fs/promises";
 import { SecretNames } from "isomorphic-lib/src/constants";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
@@ -62,15 +66,12 @@ import {
   EmailProviderType,
   EventType,
   FeatureName,
-  FeatureNamesEnum,
   Features,
   InternalEventType,
   KnownTrackData,
   MessageTemplateResourceDefinition,
   SendgridSecret,
   UserEventV2,
-  WorkspaceStatusDbEnum,
-  WorkspaceTypeAppEnum,
 } from "isomorphic-lib/src/types";
 import path from "path";
 import readline from "readline";
@@ -83,11 +84,14 @@ import { hubspotSync } from "./hubspot";
 import { resetWorkspaceData } from "./reset";
 import { spawnWithEnv } from "./spawn";
 import {
+  backfillInternalEvents,
   disentangleResendSendgrid,
   upgradeV010Post,
   upgradeV010Pre,
   upgradeV012Pre,
   upgradeV021Pre,
+  upgradeV023Post,
+  upgradeV023Pre,
 } from "./upgrades";
 
 export function createCommands(yargs: Argv): Argv {
@@ -265,66 +269,10 @@ export function createCommands(yargs: Argv): Argv {
           },
         }),
       async ({ workspaceId, all }) => {
-        let condition: SQL | undefined;
-        if (!all && workspaceId) {
-          const workspaceIds = workspaceId.split(",");
-          condition = inArray(schema.workspace.id, workspaceIds);
-        }
-        const workspaces = await db().query.workspace.findMany({
-          where: condition,
-          with: {
-            features: true,
-          },
+        await resetComputePropertiesWorkflows({
+          workspaceId,
+          all,
         });
-        logger().info(
-          {
-            queue: backendConfig().computedPropertiesTaskQueue,
-          },
-          "Resetting computed properties workflows",
-        );
-        await Promise.all(
-          workspaces.map(async (workspace) => {
-            const isGlobal = workspace.features.some(
-              (f) =>
-                // defaults to true
-                backendConfig().useGlobalComputedProperties !== false ||
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-enum-comparison
-                (f.name === FeatureNamesEnum.ComputePropertiesGlobal &&
-                  f.enabled),
-            );
-            if (
-              workspace.status !== WorkspaceStatusDbEnum.Active ||
-              workspace.type === WorkspaceTypeAppEnum.Parent ||
-              isGlobal
-            ) {
-              await terminateComputePropertiesWorkflow({
-                workspaceId: workspace.id,
-              });
-              logger().info(
-                {
-                  workspaceId: workspace.id,
-                  type: workspace.type,
-                  status: workspace.status,
-                  isGlobal,
-                },
-                "Terminated computed properties workflow",
-              );
-            } else {
-              await resetComputePropertiesWorkflow({
-                workspaceId: workspace.id,
-              });
-              logger().info(
-                {
-                  workspaceId: workspace.id,
-                  type: workspace.type,
-                  status: workspace.status,
-                },
-                "Reset computed properties workflow",
-              );
-            }
-          }),
-        );
-        logger().info("Done.");
       },
     )
     .command(
@@ -642,6 +590,108 @@ export function createCommands(yargs: Argv): Argv {
       (y) => y,
       async () => {
         await upgradeV021Pre();
+      },
+    )
+    .command(
+      "upgrade-0-23-0-pre",
+      "Run the pre-upgrade steps for the 0.23.0 prior to updating your Dittofeed application version.",
+      (cmd) =>
+        cmd.options({
+          "internal-events-backfill-limit": {
+            type: "number",
+            alias: "l",
+            default: 50000,
+            describe:
+              "The page limit for the internal events backfill. Default is 50000 events per page.",
+          },
+          "internal-events-backfill-interval-minutes": {
+            type: "number",
+            alias: "m",
+            default: 1440,
+            describe:
+              "The interval in minutes for the internal events backfill. Default is 1 day.",
+          },
+        }),
+      async ({
+        internalEventsBackfillLimit,
+        internalEventsBackfillIntervalMinutes,
+      }) => {
+        await upgradeV023Pre({
+          internalEventsBackfillLimit,
+          internalEventsBackfillIntervalMinutes,
+        });
+      },
+    )
+    .command(
+      "upgrade-0-23-0-post",
+      "Run the post-upgrade steps for the 0.23.0 after updating your Dittofeed application version.",
+      (y) => y,
+      async () => {
+        await upgradeV023Post();
+      },
+    )
+    .command(
+      "backfill-internal-events",
+      "Backfill internal_events table from user_events_v2 data.",
+      (cmd) =>
+        cmd.options({
+          "interval-minutes": {
+            type: "number",
+            alias: "i",
+            default: 1440,
+            describe:
+              "Interval in minutes for processing chunks (default: 1 day)",
+          },
+          "workspace-ids": {
+            type: "string",
+            alias: "w",
+            array: true,
+            describe:
+              "Optional list of workspace IDs to process (if not provided, processes all workspaces)",
+          },
+          "start-date": {
+            type: "string",
+            alias: "s",
+            describe:
+              "Manual start date override in ISO format (e.g., '2023-01-01T00:00:00Z')",
+          },
+          "end-date": {
+            type: "string",
+            alias: "e",
+            describe:
+              "Manual end date override in ISO format (e.g., '2023-12-31T23:59:59Z')",
+          },
+          "force-full-backfill": {
+            type: "boolean",
+            alias: "f",
+            default: false,
+            describe:
+              "Skip internal_events check and always start from earliest user_events_v2 date",
+          },
+          limit: {
+            type: "number",
+            alias: "l",
+            default: 10000,
+            describe:
+              "Number of rows to process per batch within each time window (default: 10000)",
+          },
+        }),
+      async ({
+        intervalMinutes,
+        workspaceIds,
+        startDate,
+        endDate,
+        forceFullBackfill,
+        limit,
+      }) => {
+        await backfillInternalEvents({
+          intervalMinutes,
+          workspaceIds,
+          startDate,
+          endDate,
+          forceFullBackfill,
+          limit,
+        });
       },
     )
     .command(
@@ -1051,7 +1101,6 @@ export function createCommands(yargs: Argv): Argv {
           "workspace-id": {
             type: "string",
             alias: "w",
-            require: true,
             describe: "The ID of the workspace to delete all users from.",
           },
           force: {
@@ -1061,27 +1110,31 @@ export function createCommands(yargs: Argv): Argv {
           },
         }),
       async ({ workspaceId, force }) => {
-        if (backendConfig().nodeEnv !== NodeEnvEnum.Development) {
-          logger().error(
-            "This command can only be run in development environment.",
-          );
-          return;
+        let maybeWorkspace: Workspace | undefined;
+        if (!workspaceId) {
+          if (backendConfig().nodeEnv !== NodeEnvEnum.Development) {
+            logger().error(
+              "This command can only be run without a workspace ID in development environment.",
+            );
+            return;
+          }
+          maybeWorkspace = await db().query.workspace.findFirst();
+        } else {
+          if (!validateUuid(workspaceId)) {
+            logger().error("Invalid workspace ID format.");
+            return;
+          }
+
+          maybeWorkspace = await db().query.workspace.findFirst({
+            where: eq(dbWorkspace.id, workspaceId),
+          });
         }
-
-        if (!validateUuid(workspaceId)) {
-          logger().error("Invalid workspace ID format.");
-          return;
-        }
-
-        const workspace = await db().query.workspace.findFirst({
-          where: eq(dbWorkspace.id, workspaceId),
-        });
-
-        if (!workspace) {
+        if (!maybeWorkspace) {
           logger().error("Workspace not found.");
           return;
         }
 
+        const workspace = maybeWorkspace;
         if (!force) {
           const rl = readline.createInterface({
             input: process.stdin,
@@ -1104,13 +1157,21 @@ export function createCommands(yargs: Argv): Argv {
         }
 
         logger().info(
-          `Deleting all users from workspace "${workspace.name}" (${workspace.id})...`,
+          {
+            workspaceId: workspace.id,
+            workspaceName: workspace.name,
+          },
+          `Deleting all users from workspace`,
         );
 
         try {
-          await deleteAllUsers({ workspaceId });
+          await deleteAllUsers({ workspaceId: workspace.id });
           logger().info(
-            `All users have been deleted from workspace "${workspace.name}" (${workspace.id}).`,
+            {
+              workspaceId: workspace.id,
+              workspaceName: workspace.name,
+            },
+            `All users have been deleted from workspace`,
           );
         } catch (err) {
           logger().error({ err }, "Failed to delete all users.");
@@ -1396,6 +1457,56 @@ export function createCommands(yargs: Argv): Argv {
       },
     )
     .command(
+      "keyed-user-journey-workflow-id",
+      "Generate a keyed user journey workflow ID.",
+      (cmd) =>
+        cmd.options({
+          "workspace-id": {
+            type: "string",
+            alias: "w",
+            demandOption: true,
+            describe: "The workspace ID",
+          },
+          "user-id": {
+            type: "string",
+            alias: "u",
+            demandOption: true,
+            describe: "The user ID",
+          },
+          "journey-id": {
+            type: "string",
+            alias: "j",
+            demandOption: true,
+            describe: "The journey ID",
+          },
+          "event-key": {
+            type: "string",
+            alias: "k",
+            demandOption: true,
+            describe: "The event key",
+          },
+          "event-key-value": {
+            type: "string",
+            alias: "v",
+            demandOption: true,
+            describe: "The event key value",
+          },
+        }),
+      async ({ workspaceId, userId, journeyId, eventKey, eventKeyValue }) => {
+        const workflowId = getKeyedUserJourneyWorkflowIdInner({
+          workspaceId,
+          userId,
+          journeyId,
+          eventKey,
+          eventKeyValue,
+        });
+        logger().info(
+          { workflowId },
+          "Generated keyed user journey workflow ID",
+        );
+      },
+    )
+    .command(
       "get-users",
       "Get users from a workspace.",
       (cmd) =>
@@ -1418,6 +1529,151 @@ export function createCommands(yargs: Argv): Argv {
           { throwOnError },
         );
         logger().info(users, "Users");
+      },
+    )
+    .command(
+      "generate-events-search-query",
+      "Generate optimized events search query for performance testing.",
+      (cmd) =>
+        cmd.options({
+          "workspace-id": { type: "string", alias: "w", demandOption: true },
+          "journey-id": { type: "string", alias: "j" },
+          "broadcast-id": { type: "string", alias: "b" },
+          "event-type": { type: "string", alias: "et" },
+          event: { type: "string", alias: "e", array: true },
+          "user-id": { type: "string", alias: "u" },
+          "start-date": { type: "string", alias: "s" },
+          "end-date": { type: "string", alias: "ed" },
+          limit: { type: "number", alias: "l", default: 100 },
+          offset: { type: "number", alias: "o", default: 0 },
+        }),
+      async ({
+        workspaceId,
+        journeyId,
+        broadcastId,
+        eventType,
+        event,
+        userId,
+        startDate,
+        endDate,
+        limit,
+        offset,
+      }) => {
+        const debugQb = new ClickHouseQueryBuilder({ debug: true });
+        const { query } = await buildUserEventsQuery(
+          {
+            workspaceId,
+            limit,
+            offset,
+            journeyId,
+            broadcastId,
+            eventType,
+            event,
+            userId,
+            startDate: startDate ? new Date(startDate).getTime() : undefined,
+            endDate: endDate ? new Date(endDate).getTime() : undefined,
+          },
+          debugQb,
+        );
+
+        const productionQuery = query
+          .replace(/user_events_v2/g, "dittofeed.user_events_v2")
+          .replace(/internal_events/g, "dittofeed.internal_events");
+
+        logger().info(
+          `Generated optimized events search query:\n${productionQuery}`,
+        );
+      },
+    )
+    .command(
+      "generate-deliveries-search-query",
+      "Generate optimized deliveries search query for performance testing.",
+      (cmd) =>
+        cmd.options({
+          "workspace-id": { type: "string", alias: "w", demandOption: true },
+          "journey-id": { type: "string", alias: "j" },
+          "broadcast-id": { type: "string", alias: "b" },
+          "template-ids": { type: "string", alias: "t", array: true },
+          channels: {
+            type: "string",
+            alias: "c",
+            array: true,
+            choices: ["Email", "MobilePush", "Sms", "Webhook"],
+          },
+          "user-id": { type: "string", alias: "u", array: true },
+          to: { type: "string", array: true },
+          from: { type: "string", array: true },
+          statuses: { type: "string", alias: "s", array: true },
+          "start-date": { type: "string", alias: "sd" },
+          "end-date": { type: "string", alias: "ed" },
+          "group-id": { type: "string", alias: "g", array: true },
+          "sort-by": {
+            type: "string",
+            choices: ["sentAt", "status", "from", "to"],
+            default: "sentAt",
+          },
+          "sort-direction": {
+            type: "string",
+            choices: ["Asc", "Desc"],
+            default: "Desc",
+          },
+          limit: { type: "number", alias: "l", default: 20 },
+          cursor: { type: "string" },
+        }),
+      async ({
+        workspaceId,
+        journeyId,
+        broadcastId,
+        templateIds,
+        channels,
+        userId,
+        to,
+        from,
+        statuses,
+        startDate,
+        endDate,
+        groupId,
+        sortBy,
+        sortDirection,
+        limit,
+        cursor,
+      }) => {
+        const debugQb = new ClickHouseQueryBuilder({ debug: true });
+        const { query } = await buildDeliverySearchQuery(
+          {
+            workspaceId,
+            journeyId,
+            broadcastId,
+            templateIds,
+            channels: channels as
+              | ("Email" | "MobilePush" | "Sms" | "Webhook")[]
+              | undefined,
+            userId,
+            to,
+            from,
+            statuses,
+            startDate,
+            endDate,
+            groupId,
+            sortBy: sortBy as "from" | "to" | "sentAt" | "status" | undefined,
+            sortDirection: sortDirection as "Asc" | "Desc" | undefined,
+            limit,
+            cursor,
+          },
+          debugQb,
+        );
+
+        const productionQuery = query
+          .replace(/user_events_v2/g, "dittofeed.user_events_v2")
+          .replace(/internal_events/g, "dittofeed.internal_events")
+          .replace(
+            /group_user_assignments/g,
+            "dittofeed.group_user_assignments",
+          );
+
+        logger().info(
+          `Generated optimized deliveries search query:\n${productionQuery}`,
+        );
       },
     )
     .command(

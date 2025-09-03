@@ -32,6 +32,7 @@ import {
 export interface InsertUserEvent {
   messageRaw: string | Record<string, unknown>;
   processingTime?: string;
+  serverTime?: string;
   messageId: string;
 }
 
@@ -59,11 +60,13 @@ async function insertUserEventsDirect({
       processing_time: string | null;
       workspace_id: string;
       message_id: string;
+      server_time: string | null;
     } = {
       workspace_id: workspaceId,
       message_raw: e.messageRaw,
       processing_time: e.processingTime ?? null,
       message_id: e.messageId,
+      server_time: e.serverTime ?? null,
     };
     return value;
   });
@@ -75,7 +78,7 @@ async function insertUserEventsDirect({
   };
 
   await clickhouseClient().insert({
-    table: `user_events_v2 (message_raw, processing_time, workspace_id, message_id)`,
+    table: `user_events_v2 (message_raw, processing_time, workspace_id, message_id, server_time)`,
     values,
     clickhouse_settings: settings,
     format: "JSONEachRow",
@@ -107,12 +110,13 @@ export async function insertUserEvents({
       ).send({
         topic: userEventsTopicName,
         messages: userEventsWithDefault.map(
-          ({ messageRaw, messageId, processingTime }) => ({
+          ({ messageRaw, messageId, processingTime, serverTime }) => ({
             key: messageId,
             value: JSON.stringify({
               processing_time: processingTime,
               workspace_id: workspaceId,
               message_id: messageId,
+              server_time: serverTime,
               message_raw: messageRaw,
             }),
           }),
@@ -138,7 +142,6 @@ export async function insertUserEvents({
 }
 
 export type UserEventsWithTraits = UserEvent & {
-  traits: string;
   properties: string;
   context?: string;
 };
@@ -352,22 +355,70 @@ function buildUserEventQueryClauses(
       )} OR message_id = ${qb.addQueryValue(searchTerm, "String")})`
     : "";
 
-  const eventClause =
-    event && event.length > 0
-      ? `AND event IN ${qb.addQueryValue(event, "Array(String)")}`
-      : "";
+  // Analyze event filters to determine query strategy
+  const dfEvents = event?.filter((e) => e.startsWith("DF")) ?? [];
+  const hasAllInternalEvents =
+    event && event.length > 0 && dfEvents.length === event.length;
+
+  // Use internal_events optimization if we have internal event filters (broadcastId, journeyId)
+  // OR if we're filtering by all internal events
+  const hasInternalEventFilters =
+    broadcastId || journeyId || hasAllInternalEvents;
 
   const broadcastIdClause = broadcastId
-    ? `AND JSONExtractString(properties, 'broadcastId') = ${qb.addQueryValue(broadcastId, "String")}`
+    ? `AND parsed_properties.broadcastId = ${qb.addQueryValue(broadcastId, "String")}`
     : "";
 
   const journeyIdClause = journeyId
-    ? `AND JSONExtractString(properties, 'journeyId') = ${qb.addQueryValue(journeyId, "String")}`
+    ? `AND parsed_properties.journeyId = ${qb.addQueryValue(journeyId, "String")}`
     : "";
+
+  // Event clause logic:
+  // - If all events are internal, filter in the inner query (internal_events table)
+  // - If mixed or all external, filter in the outer query (user_events_v2 table)
+  const eventClause =
+    event && event.length > 0 && !hasAllInternalEvents
+      ? `AND event IN ${qb.addQueryValue(event, "Array(String)")}`
+      : "";
 
   const eventTypeClause = eventType
     ? `AND event_type = ${qb.addQueryValue(eventType, "String")}`
     : "";
+
+  // Build internal_events filter conditions for the two-step query pattern
+  const internalEventsConditions: string[] = [];
+  if (hasInternalEventFilters) {
+    internalEventsConditions.push(
+      `workspace_id = ${qb.addQueryValue(workspaceId, "String")}`,
+    );
+
+    if (startDate) {
+      internalEventsConditions.push(
+        `processing_time >= ${qb.addQueryValue(startDate, "DateTime64(3)")}`,
+      );
+    }
+    if (endDate) {
+      internalEventsConditions.push(
+        `processing_time <= ${qb.addQueryValue(endDate, "DateTime64(3)")}`,
+      );
+    }
+    if (broadcastId) {
+      internalEventsConditions.push(
+        `broadcast_id = ${qb.addQueryValue(broadcastId, "String")}`,
+      );
+    }
+    if (journeyId) {
+      internalEventsConditions.push(
+        `journey_id = ${qb.addQueryValue(journeyId, "String")}`,
+      );
+    }
+    // If all events are internal (DF-prefixed), filter by them in internal_events
+    if (hasAllInternalEvents) {
+      internalEventsConditions.push(
+        `event IN ${qb.addQueryValue(dfEvents, "Array(String)")}`,
+      );
+    }
+  }
 
   return {
     workspaceIdClause,
@@ -380,6 +431,8 @@ function buildUserEventQueryClauses(
     broadcastIdClause,
     journeyIdClause,
     eventTypeClause,
+    hasInternalEventFilters,
+    internalEventsConditions,
   };
 }
 
@@ -416,11 +469,60 @@ function buildUserEventInnerQuery(
     journeyIdClause,
     eventTypeClause,
     messageIdClause,
+    hasInternalEventFilters,
+    internalEventsConditions,
   } = clauses;
 
   const contextField = includeContext
     ? ", JSONExtractString(message_raw, 'context') AS context"
     : "";
+
+  // Use two-step query pattern for internal event filters
+  if (hasInternalEventFilters && internalEventsConditions.length > 0) {
+    // Optimized query using nested subquery pattern from internal_events
+    return `
+      SELECT
+          workspace_id,
+          user_id,
+          user_or_anonymous_id,
+          event_time,
+          anonymous_id,
+          message_id,
+          event,
+          event_type,
+          processing_time,
+          properties,
+          CAST(('', ''), 'Tuple(broadcastId String, journeyId String)') AS parsed_properties${contextField}
+      FROM user_events_v2
+      WHERE
+        ${workspaceIdClause}
+        AND (workspace_id, processing_time, user_or_anonymous_id, event_time, message_id) IN (
+          SELECT
+            workspace_id,
+            processing_time,
+            user_or_anonymous_id,
+            event_time,
+            message_id
+          FROM internal_events
+          WHERE ${internalEventsConditions.join(" AND ")}
+        )
+        ${userIdClause}
+        ${searchClause}
+        ${eventClause}
+        ${eventTypeClause}
+        ${messageIdClause}
+      ORDER BY processing_time DESC
+    `;
+  }
+
+  // Original query for non-internal event filters
+  const parsedPropertiesField = hasInternalEventFilters
+    ? `if(
+          properties != '',
+          JSONExtract(properties, 'Tuple(broadcastId String, journeyId String)'),
+          CAST(('', ''), 'Tuple(broadcastId String, journeyId String)')
+        ) AS parsed_properties`
+    : "CAST(('', ''), 'Tuple(broadcastId String, journeyId String)') AS parsed_properties";
 
   return `
     SELECT
@@ -433,8 +535,8 @@ function buildUserEventInnerQuery(
         event,
         event_type,
         processing_time,
-        JSONExtractRaw(message_raw, 'traits') AS traits,
-        JSONExtractRaw(message_raw, 'properties') AS properties${contextField}
+        properties,
+        ${parsedPropertiesField}${contextField}
     FROM user_events_v2
     WHERE
       ${workspaceIdClause}
@@ -451,39 +553,18 @@ function buildUserEventInnerQuery(
   `;
 }
 
-export async function findUserEvents({
-  workspaceId,
-  limit = 100,
-  offset = 0,
-  startDate,
-  endDate,
-  userId,
-  searchTerm,
-  event,
-  broadcastId,
-  journeyId,
-  eventType,
-  messageId,
-  includeContext,
-}: GetEventsRequest): Promise<UserEventsWithTraits[]> {
-  const qb = new ClickHouseQueryBuilder();
+export async function buildUserEventsQuery(
+  params: GetEventsRequest,
+  qb: ClickHouseQueryBuilder,
+  includeContext?: boolean,
+): Promise<{
+  query: string;
+  queryParams: Record<string, unknown>;
+}> {
+  const { workspaceId, limit = 100, offset = 0 } = params;
 
   const workspaceIdClause = await buildWorkspaceIdClause(workspaceId, qb);
-  const queryClauses = buildUserEventQueryClauses(
-    {
-      workspaceId,
-      startDate,
-      endDate,
-      userId,
-      searchTerm,
-      event,
-      broadcastId,
-      journeyId,
-      eventType,
-      messageId,
-    },
-    qb,
-  );
+  const queryClauses = buildUserEventQueryClauses(params, qb);
 
   const paginationClause = limit
     ? `LIMIT ${qb.addQueryValue(offset, "Int32")},${qb.addQueryValue(
@@ -505,15 +586,57 @@ export async function findUserEvents({
     ${paginationClause}
   `;
 
+  return {
+    query: eventsQuery,
+    queryParams: qb.getQueries(),
+  };
+}
+
+export async function findUserEvents({
+  workspaceId,
+  limit = 100,
+  offset = 0,
+  startDate,
+  endDate,
+  userId,
+  searchTerm,
+  event,
+  broadcastId,
+  journeyId,
+  eventType,
+  messageId,
+  includeContext,
+  abortSignal,
+}: GetEventsRequest & { abortSignal?: AbortSignal }): Promise<
+  UserEventsWithTraits[]
+> {
+  const qb = new ClickHouseQueryBuilder();
+  const { query: eventsQuery, queryParams } = await buildUserEventsQuery(
+    {
+      workspaceId,
+      limit,
+      offset,
+      startDate,
+      endDate,
+      userId,
+      searchTerm,
+      event,
+      broadcastId,
+      journeyId,
+      eventType,
+      messageId,
+    },
+    qb,
+    includeContext,
+  );
+
   const eventsResultSet = await chQuery({
     query: eventsQuery,
     format: "JSONEachRow",
-    query_params: qb.getQueries(),
+    query_params: queryParams,
+    abort_signal: abortSignal,
   });
-  logger().debug(
-    { eventsQuery, queryParams: qb.getQueries() },
-    "findUserEvents query",
-  );
+  logger().debug({ eventsQuery, queryParams }, "findUserEvents query");
 
   return await eventsResultSet.json<UserEventsWithTraits>();
 }
@@ -530,7 +653,10 @@ export async function findUserEventCount({
   eventType,
   messageId,
   includeContext,
-}: Omit<GetEventsRequest, "limit" | "offset">): Promise<number> {
+  abortSignal,
+}: Omit<GetEventsRequest, "limit" | "offset"> & {
+  abortSignal?: AbortSignal;
+}): Promise<number> {
   const qb = new ClickHouseQueryBuilder();
 
   const workspaceIdClause = await buildWorkspaceIdClause(workspaceId, qb);
@@ -568,6 +694,7 @@ export async function findUserEventCount({
     query: countQuery,
     format: "JSONEachRow",
     query_params: qb.getQueries(),
+    abort_signal: abortSignal,
   });
 
   const countResults = await countResultSet.json<{ count: number }>();
@@ -588,7 +715,8 @@ export async function findManyEventsWithCount({
   eventType,
   messageId,
   includeContext,
-}: GetEventsRequest): Promise<{
+  abortSignal,
+}: GetEventsRequest & { abortSignal?: AbortSignal }): Promise<{
   events: UserEventsWithTraits[];
   count: number;
 }> {
@@ -607,6 +735,7 @@ export async function findManyEventsWithCount({
       eventType,
       messageId,
       includeContext,
+      abortSignal,
     }),
     findUserEventCount({
       workspaceId,
@@ -620,6 +749,7 @@ export async function findManyEventsWithCount({
       eventType,
       messageId,
       includeContext,
+      abortSignal,
     }),
   ]);
 
@@ -717,8 +847,8 @@ export async function buildEventsFile(params: DownloadEventsRequest): Promise<{
     anonymousId: event.anonymous_id || "",
     processingTime: event.processing_time,
     eventTime: event.event_time,
-    traits: event.traits,
-    properties: event.properties,
+    traits: event.event_type === EventType.Identify ? event.properties : "",
+    properties: event.event_type === EventType.Identify ? "" : event.properties,
   }));
 
   // Define CSV headers
@@ -796,13 +926,15 @@ export async function findUserEventsById({
   return await resultSet.json<UserEventsWithTraits>();
 }
 
+export interface GetEventsByIdParams {
+  workspaceId: string;
+  eventIds: string[];
+}
+
 export async function getEventsById({
   workspaceId,
   eventIds,
-}: {
-  workspaceId: string;
-  eventIds: string[];
-}): Promise<UserWorkflowTrackEvent[]> {
+}: GetEventsByIdParams): Promise<UserWorkflowTrackEvent[]> {
   const events = await findUserEvents({
     workspaceId,
     messageId: eventIds,

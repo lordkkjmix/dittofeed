@@ -9,6 +9,7 @@ import {
   workflowInfo,
 } from "@temporalio/workflow";
 import * as wf from "@temporalio/workflow";
+import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import { omit } from "remeda";
 import { v5 as uuidV5 } from "uuid";
 
@@ -48,6 +49,13 @@ const { defaultWorkerLogger: logger } = proxySinks<LoggerSinks>();
 
 export const segmentUpdateSignal =
   wf.defineSignal<[SegmentUpdate]>("segmentUpdate");
+
+export interface ReEvaluateSegmentsParams {
+  segmentIds?: string[];
+}
+
+export const reEvaluateSegmentsSignal =
+  wf.defineSignal<[ReEvaluateSegmentsParams]>("reEvaluateSegments");
 
 export enum TrackSignalParamsVersion {
   V1 = 1,
@@ -93,6 +101,26 @@ type ReceivedSegmentUpdate = Pick<
   "currentlyInSegment" | "segmentVersion"
 >;
 
+export function getKeyedUserJourneyWorkflowIdInner({
+  workspaceId,
+  userId,
+  journeyId,
+  eventKey,
+  eventKeyValue,
+}: {
+  workspaceId: string;
+  userId: string;
+  journeyId: string;
+  eventKey: string;
+  eventKeyValue: string;
+}): string | null {
+  const combined = uuidV5(
+    [userId, eventKey, eventKeyValue].join("-"),
+    workspaceId,
+  );
+  return `user-journey-keyed-${workspaceId}-${journeyId}-${combined}`;
+}
+
 export function getKeyedUserJourneyWorkflowId({
   workspaceId,
   userId,
@@ -124,9 +152,13 @@ export function getKeyedUserJourneyWorkflowId({
     key = "messageId";
     keyValue = event.messageId;
   }
-
-  const combined = uuidV5([userId, key, keyValue].join("-"), workspaceId);
-  return `user-journey-keyed-${workspaceId}-${journeyId}-${combined}`;
+  return getKeyedUserJourneyWorkflowIdInner({
+    workspaceId,
+    userId,
+    journeyId,
+    eventKey: key,
+    eventKeyValue: keyValue,
+  });
 }
 
 export function getUserJourneyWorkflowId({
@@ -139,14 +171,14 @@ export function getUserJourneyWorkflowId({
   return `user-journey-${userId}-${journeyId}`;
 }
 
-export enum UserJourneyWorkflowVersion {
-  V1 = 1,
-  V2 = 2,
-  V3 = 3,
-}
+export const UserJourneyWorkflowVersion = {
+  V1: 1,
+  V2: 2,
+  V3: 3,
+} as const;
 
 export interface UserJourneyWorkflowPropsV3 {
-  version: UserJourneyWorkflowVersion.V3;
+  version: typeof UserJourneyWorkflowVersion.V3;
   workspaceId: string;
   userId: string;
   definition: JourneyDefinition;
@@ -158,7 +190,7 @@ export interface UserJourneyWorkflowPropsV3 {
 }
 
 export interface UserJourneyWorkflowPropsV2 {
-  version: UserJourneyWorkflowVersion.V2;
+  version: typeof UserJourneyWorkflowVersion.V2;
   workspaceId: string;
   userId: string;
   definition: JourneyDefinition;
@@ -174,7 +206,7 @@ export interface UserJourneyWorkflowPropsV1 {
   journeyId: string;
   eventKey?: string;
   context?: Record<string, JSONValue>;
-  version?: UserJourneyWorkflowVersion.V1;
+  version?: typeof UserJourneyWorkflowVersion.V1;
   shouldContinueAsNew?: boolean;
 }
 
@@ -474,6 +506,56 @@ export async function userJourneyWorkflow(
     });
   });
 
+  wf.setHandler(reEvaluateSegmentsSignal, async (params) => {
+    logger.info("re-evaluating segments", {
+      workflow: WORKFLOW_NAME,
+      journeyId,
+      userId,
+      workspaceId,
+      segmentIds: params.segmentIds,
+    });
+
+    const segmentIdsToEvaluate =
+      params.segmentIds ?? Array.from(segmentAssignments.keys());
+    const nowMs = Date.now();
+
+    await Promise.all(
+      segmentIdsToEvaluate.map(async (segmentId) => {
+        const assignment = await getSegmentAssignmentHandler({
+          segmentId,
+          now: nowMs,
+        });
+
+        if (assignment === null) {
+          logger.warn("segment assignment returned null during re-evaluation", {
+            workflow: WORKFLOW_NAME,
+            journeyId,
+            userId,
+            workspaceId,
+            segmentId,
+          });
+          return;
+        }
+
+        segmentAssignments.set(segmentId, {
+          currentlyInSegment: assignment.inSegment,
+          segmentVersion: nowMs,
+        });
+
+        logger.info("segment re-evaluated", {
+          workflow: WORKFLOW_NAME,
+          journeyId,
+          userId,
+          workspaceId,
+          segmentId,
+          inSegment: assignment.inSegment,
+        });
+      }),
+    );
+
+    reportWorkflowInfoHandler();
+  });
+
   let currentNode: JourneyNode = definition.entryNode;
   let nextNode: JourneyNode | null = null;
 
@@ -712,10 +794,24 @@ export async function userJourneyWorkflow(
       }
       case JourneyNodeType.MessageNode: {
         const messageId = uuid4();
-        const triggeringMessageId =
-          props.version === UserJourneyWorkflowVersion.V2
-            ? props.event?.messageId
-            : undefined;
+        let triggeringMessageId: string | undefined;
+        switch (props.version) {
+          case undefined:
+          case UserJourneyWorkflowVersion.V1: {
+            break;
+          }
+          case UserJourneyWorkflowVersion.V2: {
+            triggeringMessageId = props.event?.messageId;
+            break;
+          }
+          case UserJourneyWorkflowVersion.V3: {
+            triggeringMessageId = props.messageId;
+            break;
+          }
+          default: {
+            assertUnreachable(props);
+          }
+        }
         const messagePayload: Omit<activities.SendParams, "templateId"> = {
           userId,
           workspaceId,

@@ -44,6 +44,7 @@ import { getWarningStyles } from "../../lib/warningTheme";
 import { AuthorizeGmail } from "../authorizeGmail";
 import { Calendar } from "../calendar";
 import { GreyButton, greyButtonStyle } from "../greyButtonStyle";
+import InfoTooltip from "../infoTooltip";
 import { TimeField } from "../timeField";
 import { TimezoneAutocomplete } from "../timezoneAutocomplete";
 import {
@@ -146,6 +147,7 @@ export default function Configuration({
       case ChannelType.Sms:
         return [
           { id: SmsProviderType.Twilio, label: "Twilio" },
+          { id: SmsProviderType.SignalWire, label: "SignalWire" },
           { id: SmsProviderType.Test, label: "Test" },
         ];
       case ChannelType.Webhook:
@@ -343,12 +345,15 @@ export default function Configuration({
               style={{ padding: 8 }}
             />
           </Popover>
-          <TimezoneAutocomplete
-            defaultToLocal
-            value={broadcast.config.defaultTimezone}
-            handler={handleTimezoneChange}
-            disabled={broadcast.status !== "Draft"}
-          />
+          <Stack direction="row" spacing={1} alignItems="center">
+            <TimezoneAutocomplete
+              value={broadcast.config.defaultTimezone}
+              handler={handleTimezoneChange}
+              disabled={broadcast.status !== "Draft"}
+              label="Default Timezone"
+            />
+            <InfoTooltip title="The timezone used by default if a user’s timezone cannot be determined." />
+          </Stack>
         </>
       )}
       {!state.configuration?.hideRateLimit && (

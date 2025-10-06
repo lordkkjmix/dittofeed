@@ -57,6 +57,8 @@ import {
   sendSms as sendSmsTwilio,
   TwilioAuth,
 } from "./destinations/twilio";
+import { sendSms as sendSmsBrevo } from "./destinations/brevo";
+import { sendSms as sendSmsWhatsAppCloud } from "./destinations/whatsappCloud";
 import {
   getAndRefreshGmailAccessToken,
   sendGmailEmail,
@@ -84,6 +86,7 @@ import {
   BatchMessageUsersResponse,
   BatchMessageUsersResult,
   BatchMessageUsersResultTypeEnum,
+  BrevoSmsSecret,
   ChannelType,
   EmailContentsType,
   EmailProviderSecret,
@@ -124,6 +127,7 @@ import {
   WebhookConfig,
   WebhookResponse,
   WebhookSecret,
+  WhatsAppCloudSecret,
 } from "./types";
 import { UserPropertyAssignments } from "./userProperties";
 import { getUsers } from "./users";
@@ -2066,6 +2070,122 @@ export async function sendSms(
             type: SmsProviderType.SignalWire,
             sid: result.value.sid,
             status: result.value.status,
+          },
+        },
+      });
+    }
+    case SmsProviderType.Brevo: {
+      const configResult = schemaValidateWithErr(
+        parsedConfigResult.value,
+        BrevoSmsSecret,
+      );
+      if (configResult.isErr()) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: configResult.error.message,
+          },
+        });
+      }
+
+      const { apiKey, sender } = configResult.value;
+
+      if (!apiKey) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: `missing apiKey in Brevo provider config`,
+          },
+        });
+      }
+
+      const result = await sendSmsBrevo({
+        apiKey,
+        sender,
+        to,
+        body,
+        tags: messageTags,
+      });
+
+      if (result.isErr()) {
+        return err({
+          type: InternalEventType.MessageFailure,
+          variant: {
+            type: ChannelType.Sms,
+            provider: result.error,
+          },
+        });
+      }
+
+      return ok({
+        type: InternalEventType.MessageSent,
+        variant: {
+          type: ChannelType.Sms,
+          body,
+          to,
+          provider: {
+            type: SmsProviderType.Brevo,
+            messageId: result.value.messageId,
+          },
+        },
+      });
+    }
+    case SmsProviderType.WhatsAppCloud: {
+      const configResult = schemaValidateWithErr(
+        parsedConfigResult.value,
+        WhatsAppCloudSecret,
+      );
+      if (configResult.isErr()) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: configResult.error.message,
+          },
+        });
+      }
+
+      const { accessToken, phoneNumberId } = configResult.value;
+
+      if (!accessToken || !phoneNumberId) {
+        return err({
+          type: InternalEventType.BadWorkspaceConfiguration,
+          variant: {
+            type: BadWorkspaceConfigurationType.MessageServiceProviderMisconfigured,
+            message: `missing accessToken or phoneNumberId in WhatsApp Cloud provider config`,
+          },
+        });
+      }
+
+      const result = await sendSmsWhatsAppCloud({
+        accessToken,
+        phoneNumberId,
+        to,
+        body,
+        tags: messageTags,
+      });
+
+      if (result.isErr()) {
+        return err({
+          type: InternalEventType.MessageFailure,
+          variant: {
+            type: ChannelType.Sms,
+            provider: result.error,
+          },
+        });
+      }
+
+      return ok({
+        type: InternalEventType.MessageSent,
+        variant: {
+          type: ChannelType.Sms,
+          body,
+          to,
+          provider: {
+            type: SmsProviderType.WhatsAppCloud,
+            messageId: result.value.messageId,
           },
         },
       });

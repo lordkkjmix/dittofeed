@@ -176,6 +176,8 @@ export type ChannelType = (typeof ChannelType)[keyof typeof ChannelType];
 export enum SmsProviderType {
   Twilio = "Twilio",
   SignalWire = "SignalWire",
+  Brevo = "Brevo",
+  WhatsAppCloud = "WhatsAppCloud",
   Test = "Test",
 }
 
@@ -3680,6 +3682,23 @@ export const SignalWireSecret = Type.Object({
 
 export type SignalWireSecret = Static<typeof SignalWireSecret>;
 
+export const BrevoSmsSecret = Type.Object({
+  type: Type.Literal(SmsProviderType.Brevo),
+  apiKey: Type.Optional(Type.String()),
+  sender: Type.Optional(Type.String()),
+});
+
+export type BrevoSmsSecret = Static<typeof BrevoSmsSecret>;
+
+export const WhatsAppCloudSecret = Type.Object({
+  type: Type.Literal(SmsProviderType.WhatsAppCloud),
+  accessToken: Type.Optional(Type.String()),
+  phoneNumberId: Type.Optional(Type.String()),
+  businessAccountId: Type.Optional(Type.String()),
+});
+
+export type WhatsAppCloudSecret = Static<typeof WhatsAppCloudSecret>;
+
 export const TestSmsSecret = Type.Object({
   type: Type.Literal(SmsProviderType.Test),
 });
@@ -3696,8 +3715,10 @@ export type TestSmsProvider = Static<typeof TestSmsProvider>;
 
 export const SmsProviderSecret = Type.Union([
   TwilioSecret,
-  TestSmsSecret,
   SignalWireSecret,
+  BrevoSmsSecret,
+  WhatsAppCloudSecret,
+  TestSmsSecret,
 ]);
 
 export type SmsProviderSecret = Static<typeof SmsProviderSecret>;
@@ -3752,6 +3773,20 @@ export const SmsSignalWireSuccess = Type.Object({
 
 export type SmsSignalWireSuccess = Static<typeof SmsSignalWireSuccess>;
 
+export const SmsBrevoSuccess = Type.Object({
+  type: Type.Literal(SmsProviderType.Brevo),
+  messageId: Type.String(),
+});
+
+export type SmsBrevoSuccess = Static<typeof SmsBrevoSuccess>;
+
+export const SmsWhatsAppCloudSuccess = Type.Object({
+  type: Type.Literal(SmsProviderType.WhatsAppCloud),
+  messageId: Type.String(),
+});
+
+export type SmsWhatsAppCloudSuccess = Static<typeof SmsWhatsAppCloudSuccess>;
+
 export const SmsTestSuccess = Type.Object({
   type: Type.Literal(SmsProviderType.Test),
 });
@@ -3761,6 +3796,8 @@ export type SmsTestSuccess = Static<typeof SmsTestSuccess>;
 export const SmsServiceProviderSuccess = Type.Union([
   SmsTwilioSuccess,
   SmsSignalWireSuccess,
+  SmsBrevoSuccess,
+  SmsWhatsAppCloudSuccess,
   SmsTestSuccess,
 ]);
 
@@ -4186,9 +4223,31 @@ export type MessageSignalWireServiceFailure = Static<
   typeof MessageSignalWireServiceFailure
 >;
 
+export const MessageBrevoServiceFailure = Type.Object({
+  type: Type.Literal(SmsProviderType.Brevo),
+  errorCode: Type.String(),
+  errorMessage: Type.String(),
+});
+
+export type MessageBrevoServiceFailure = Static<
+  typeof MessageBrevoServiceFailure
+>;
+
+export const MessageWhatsAppCloudServiceFailure = Type.Object({
+  type: Type.Literal(SmsProviderType.WhatsAppCloud),
+  errorCode: Type.String(),
+  errorMessage: Type.String(),
+});
+
+export type MessageWhatsAppCloudServiceFailure = Static<
+  typeof MessageWhatsAppCloudServiceFailure
+>;
+
 export const SmsServiceProviderFailure = Type.Union([
   MessageTwilioServiceFailure,
   MessageSignalWireServiceFailure,
+  MessageBrevoServiceFailure,
+  MessageWhatsAppCloudServiceFailure,
 ]);
 
 export type SmsServiceProviderFailure = Static<

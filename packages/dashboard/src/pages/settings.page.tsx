@@ -1298,6 +1298,12 @@ function DefaultSmsConfig() {
       case SmsProviderType.SignalWire:
         name = "SignalWire";
         break;
+      case SmsProviderType.Brevo:
+        name = "Brevo";
+        break;
+      case SmsProviderType.WhatsAppCloud:
+        name = "WhatsApp Cloud";
+        break;
       case SmsProviderType.Test:
         name = "Test";
         break;
@@ -1551,6 +1557,132 @@ function SignalWireConfig() {
   );
 }
 
+function BrevoConfig() {
+  const secretAvailability = useSecretAvailability();
+  return (
+    <Fields
+      sections={[
+        {
+          id: "brevo-section",
+          fieldGroups: [
+            {
+              id: "brevo-fields",
+              name: "Brevo",
+              fields: [
+                {
+                  id: "brevo-api-key",
+                  type: "secret",
+                  fieldProps: {
+                    name: SecretNames.Brevo,
+                    secretKey: "apiKey",
+                    label: "API Key",
+                    helperText: "Brevo API key used to authenticate requests",
+                    type: SmsProviderType.Brevo,
+                    saved: isSecretSaved(
+                      SecretNames.Brevo,
+                      "apiKey",
+                      secretAvailability,
+                    ),
+                  },
+                },
+                {
+                  id: "brevo-sender",
+                  type: "secret",
+                  fieldProps: {
+                    name: SecretNames.Brevo,
+                    secretKey: "sender",
+                    label: "Sender Name",
+                    helperText:
+                      "Default sender name for SMS (optional, defaults to 'Dittofeed')",
+                    type: SmsProviderType.Brevo,
+                    saved: isSecretSaved(
+                      SecretNames.Brevo,
+                      "sender",
+                      secretAvailability,
+                    ),
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ]}
+    />
+  );
+}
+
+function WhatsAppCloudConfig() {
+  const secretAvailability = useSecretAvailability();
+  return (
+    <Fields
+      sections={[
+        {
+          id: "whatsapp-cloud-section",
+          fieldGroups: [
+            {
+              id: "whatsapp-cloud-fields",
+              name: "WhatsApp Cloud API",
+              fields: [
+                {
+                  id: "whatsapp-cloud-access-token",
+                  type: "secret",
+                  fieldProps: {
+                    name: SecretNames.WhatsAppCloud,
+                    secretKey: "accessToken",
+                    label: "Access Token",
+                    helperText:
+                      "WhatsApp Cloud API access token (System User Token or User Access Token)",
+                    type: SmsProviderType.WhatsAppCloud,
+                    saved: isSecretSaved(
+                      SecretNames.WhatsAppCloud,
+                      "accessToken",
+                      secretAvailability,
+                    ),
+                  },
+                },
+                {
+                  id: "whatsapp-cloud-phone-number-id",
+                  type: "secret",
+                  fieldProps: {
+                    name: SecretNames.WhatsAppCloud,
+                    secretKey: "phoneNumberId",
+                    label: "Phone Number ID",
+                    helperText:
+                      "WhatsApp Business Phone Number ID (found in your WhatsApp Business Account)",
+                    type: SmsProviderType.WhatsAppCloud,
+                    saved: isSecretSaved(
+                      SecretNames.WhatsAppCloud,
+                      "phoneNumberId",
+                      secretAvailability,
+                    ),
+                  },
+                },
+                {
+                  id: "whatsapp-cloud-business-account-id",
+                  type: "secret",
+                  fieldProps: {
+                    name: SecretNames.WhatsAppCloud,
+                    secretKey: "businessAccountId",
+                    label: "Business Account ID",
+                    helperText:
+                      "WhatsApp Business Account ID (optional, for advanced features)",
+                    type: SmsProviderType.WhatsAppCloud,
+                    saved: isSecretSaved(
+                      SecretNames.WhatsAppCloud,
+                      "businessAccountId",
+                      secretAvailability,
+                    ),
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ]}
+    />
+  );
+}
+
 function SmsChannelConfig() {
   return (
     <>
@@ -1558,6 +1690,8 @@ function SmsChannelConfig() {
       <DefaultSmsConfig />
       <Twilios />
       <SignalWireConfig />
+      <BrevoConfig />
+      <WhatsAppCloudConfig />
     </>
   );
 }

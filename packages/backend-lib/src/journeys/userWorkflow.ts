@@ -855,6 +855,27 @@ export async function userJourneyWorkflow(
                 };
                 break;
               }
+              case SmsProviderType.SignalWire: {
+                smsProviderOverride = {
+                  providerOverride: SmsProviderType.SignalWire,
+                  senderOverride,
+                };
+                break;
+              }
+              case SmsProviderType.Brevo: {
+                smsProviderOverride = {
+                  providerOverride: SmsProviderType.Brevo,
+                  senderOverride: undefined,
+                };
+                break;
+              }
+              case SmsProviderType.WhatsAppCloud: {
+                smsProviderOverride = {
+                  providerOverride: SmsProviderType.WhatsAppCloud,
+                  senderOverride: undefined,
+                };
+                break;
+              }
               case SmsProviderType.Test: {
                 smsProviderOverride = {
                   providerOverride: SmsProviderType.Test,

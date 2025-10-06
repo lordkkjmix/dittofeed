@@ -148,6 +148,8 @@ export default function Configuration({
         return [
           { id: SmsProviderType.Twilio, label: "Twilio" },
           { id: SmsProviderType.SignalWire, label: "SignalWire" },
+          { id: SmsProviderType.Brevo, label: "Brevo" },
+          { id: SmsProviderType.WhatsAppCloud, label: "WhatsApp Cloud" },
           { id: SmsProviderType.Test, label: "Test" },
         ];
       case ChannelType.Webhook:

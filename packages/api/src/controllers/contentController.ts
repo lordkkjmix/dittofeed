@@ -413,6 +413,46 @@ export default async function contentController(fastify: FastifyInstance) {
                   },
                 });
               }
+              case SmsProviderType.Brevo: {
+                const suggestions: string[] = [];
+                if (provider.errorCode) {
+                  suggestions.push(`Error code: ${provider.errorCode}`);
+                }
+                if (provider.errorMessage) {
+                  suggestions.push(provider.errorMessage);
+                } else {
+                  suggestions.push(
+                    "Failed to send SMS via Brevo. Check your API key and sender configuration.",
+                  );
+                }
+                return reply.status(200).send({
+                  type: JsonResultType.Err,
+                  err: {
+                    suggestions,
+                    responseData: JSON.stringify(provider, null, 2),
+                  },
+                });
+              }
+              case SmsProviderType.WhatsAppCloud: {
+                const suggestions: string[] = [];
+                if (provider.errorCode) {
+                  suggestions.push(`Error code: ${provider.errorCode}`);
+                }
+                if (provider.errorMessage) {
+                  suggestions.push(provider.errorMessage);
+                } else {
+                  suggestions.push(
+                    "Failed to send message via WhatsApp Cloud API. Verify your access token, phone number ID, and recipient number format.",
+                  );
+                }
+                return reply.status(200).send({
+                  type: JsonResultType.Err,
+                  err: {
+                    suggestions,
+                    responseData: JSON.stringify(provider, null, 2),
+                  },
+                });
+              }
               default: {
                 return reply.status(200).send({
                   type: JsonResultType.Err,

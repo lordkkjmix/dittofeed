@@ -23,6 +23,7 @@ import { Overwrite } from "utility-types";
 import { v5 as uuidv5 } from "uuid";
 
 import { submitBatch } from "../apps/batch";
+import { canWorkspaceReceiveEventsById } from "../auth";
 import { MESSAGE_METADATA_FIELDS } from "../constants";
 import logger from "../logger";
 import { withSpan } from "../openTelemetry";
@@ -205,6 +206,10 @@ export async function submitAmazonSesEvents(
       return err(new Error("Workspace id not found"));
     }
 
+    if (!(await canWorkspaceReceiveEventsById({ workspaceId }))) {
+      return err(new Error("Workspace not eligible"));
+    }
+
     let timestamp: string;
     let eventName: InternalEventType;
     switch (event.eventType) {
@@ -234,7 +239,10 @@ export async function submitAmazonSesEvents(
         );
     }
 
-    const messageId = uuidv5(event.mail.messageId, workspaceId);
+    const messageId = uuidv5(
+      `${event.eventType}:${event.mail.messageId}`,
+      workspaceId,
+    );
     const metadataTags = R.pick(tags, MESSAGE_METADATA_FIELDS);
 
     const items: BatchTrackData[] = [];

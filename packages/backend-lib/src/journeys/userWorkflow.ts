@@ -30,6 +30,7 @@ import {
   JourneyNodeType,
   JSONValue,
   MessageVariant,
+  RandomCohortNode,
   RenameKey,
   SegmentAssignment,
   SegmentAssignment as SegmentAssignmentDb,
@@ -78,18 +79,28 @@ export const trackSignal = wf.defineSignal<[TrackSignalParams]>("track");
 const WORKFLOW_NAME = "userJourneyWorkflow";
 
 const {
-  getSegmentAssignment,
   onNodeProcessedV2,
   isRunnable,
-  sendMessageV2,
   findNextLocalizedTime,
   getEarliestComputePropertyPeriod,
   getUserPropertyDelay,
   getWorkspace,
   shouldReEnter,
-  getEventsById,
 } = proxyActivities<typeof activities>({
   startToCloseTimeout: "2 minutes",
+});
+
+const { getEventsById, getSegmentAssignment } = wf.proxyLocalActivities<
+  typeof activities
+>({
+  startToCloseTimeout: "2 minutes",
+  retry: {
+    maximumAttempts: 10,
+  },
+});
+
+const { getRandomNumber } = wf.proxyLocalActivities<typeof activities>({
+  startToCloseTimeout: "5 seconds",
 });
 
 const { reportWorkflowInfo } = wf.proxyLocalActivities<typeof activities>({
@@ -710,7 +721,7 @@ export async function userJourneyWorkflow(
               if (assignment === null) {
                 return [];
               }
-              if (assignment.inSegment === true) {
+              if (assignment.inSegment) {
                 segmentAssignments.set(segmentId, {
                   currentlyInSegment: assignment.inSegment,
                   segmentVersion: Date.now(),
@@ -888,10 +899,19 @@ export async function userJourneyWorkflow(
           context: entryEventProperties,
           isHidden,
         };
+        if (currentNode.retryCount) {
+          sendMesssageParams.retryCount = currentNode.retryCount;
+        }
         if (props.version === UserJourneyWorkflowVersion.V3) {
           sendMesssageParams.eventIds = Array.from(keyedEventIds);
         }
 
+        const { sendMessageV2 } = proxyActivities<typeof activities>({
+          startToCloseTimeout: "2 minutes",
+          retry: {
+            maximumAttempts: currentNode.retryCount ?? 3,
+          },
+        });
         const messageSucceeded = await sendMessageV2(sendMesssageParams);
 
         if (!messageSucceeded && !currentNode.skipOnFailure) {
@@ -950,12 +970,41 @@ export async function userJourneyWorkflow(
       case JourneyNodeType.ExitNode: {
         break nodeLoop;
       }
-      case JourneyNodeType.ExperimentSplitNode: {
-        logger.error("unable to handle un-implemented node type", {
-          ...defaultLoggingFields,
-          nodeType: currentNode.type,
-        });
-        nextNode = definition.exitNode;
+      case JourneyNodeType.RandomCohortNode: {
+        const cn: RandomCohortNode = currentNode;
+        // Use getRandom local activity for deterministic behavior
+        const randomValue = (await getRandomNumber()) * 100;
+
+        let cumulativePercent = 0;
+        let selectedChildId: string | null = null;
+
+        for (const child of cn.children) {
+          cumulativePercent += child.percent;
+          if (randomValue < cumulativePercent) {
+            selectedChildId = child.id;
+            break;
+          }
+        }
+
+        if (!selectedChildId) {
+          logger.error("no child selected in random cohort", {
+            ...defaultLoggingFields,
+            randomValue,
+          });
+          nextNode = definition.exitNode;
+          break;
+        }
+
+        nextNode = nodes.get(selectedChildId) ?? null;
+
+        if (!nextNode) {
+          logger.error("missing random cohort child node", {
+            ...defaultLoggingFields,
+            childId: selectedChildId,
+          });
+          nextNode = definition.exitNode;
+          break;
+        }
         break;
       }
       case JourneyNodeType.RateLimitNode: {

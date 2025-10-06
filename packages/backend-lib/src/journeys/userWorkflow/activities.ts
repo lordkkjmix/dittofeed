@@ -1,8 +1,9 @@
 import { Histogram, SpanStatusCode } from "@opentelemetry/api";
+import { Context } from "@temporalio/activity";
 import { and, eq, inArray } from "drizzle-orm";
 import { ENTRY_TYPES } from "isomorphic-lib/src/constants";
 import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
-import { err, ok } from "neverthrow";
+import { err, Result } from "neverthrow";
 import pRetry from "p-retry";
 import { omit } from "remeda";
 
@@ -33,6 +34,8 @@ import {
   JourneyDefinition,
   JourneyNodeType,
   JSONValue,
+  MessageSendFailure,
+  MessageSuccess,
   MessageTags,
   MessageVariant,
   RenameKey,
@@ -42,7 +45,10 @@ import {
   TrackData,
   UserWorkflowTrackEvent,
 } from "../../types";
-import { getEventsById as gebi, GetEventsByIdParams } from "../../userEvents";
+import {
+  GetEventsByIdParams,
+  getTrackEventsById as gebi,
+} from "../../userEvents";
 import { findAllUserPropertyAssignments } from "../../userProperties";
 import {
   recordNodeProcessed,
@@ -53,21 +59,32 @@ import { GetSegmentAssignmentVersion } from "./types";
 export { findNextLocalizedTime, getUserPropertyDelay } from "../../dates";
 export { findAllUserPropertyAssignments } from "../../userProperties";
 
+function safeWorkflowId(): string | undefined {
+  try {
+    return Context.current().info.workflowExecution.workflowId;
+  } catch (error) {
+    logger().debug({ err: error }, "failed to read workflow id from context");
+    return undefined;
+  }
+}
+
 export async function getEventsById(
   params: GetEventsByIdParams,
   metadata?: { journeyId?: string; userId: string },
 ): Promise<UserWorkflowTrackEvent[]> {
   const events = await gebi(params);
-  if (events.length !== params.eventIds.length) {
-    const missing = params.eventIds.filter(
-      (id) => !events.some((e) => e.messageId === id),
-    );
+  const missing = params.eventIds.filter(
+    (id) => !events.some((e) => e.messageId === id),
+  );
+  if (missing.length > 0) {
+    const workflowId = safeWorkflowId();
     logger().info(
       {
         workspaceId: params.workspaceId,
         missing,
         journeyId: metadata?.journeyId,
         userId: metadata?.userId,
+        workflowId,
       },
       "not all events found for user journey",
     );
@@ -85,12 +102,14 @@ export async function getEventsByIdWithRetry(
     const events = await pRetry(() => getEventsById(params, metadata));
     return events;
   } catch (e) {
+    const workflowId = safeWorkflowId();
     logger().error(
       {
         err: e,
         workspaceId: params.workspaceId,
         journeyId: metadata.journeyId,
         userId: metadata.userId,
+        workflowId,
       },
       "not all events found for user journey after retries",
     );
@@ -116,11 +135,22 @@ export type SendParamsV2 = BaseSendParams & {
   events?: UserWorkflowTrackEvent[];
   eventIds?: string[];
   isHidden?: boolean;
+  retryCount?: number;
 };
 
 export type SendParamsInner = SendParamsV2 & {
   sender: (params: SendMessageParameters) => Promise<BackendMessageSendResult>;
 };
+
+interface JourneyEarlyExit {
+  type: InternalEventType.JourneyEarlyExit;
+  message: string;
+}
+
+type SendMessageInnerResult = Result<
+  MessageSuccess,
+  MessageSendFailure | JourneyEarlyExit
+>;
 
 async function sendMessageInner({
   userId,
@@ -134,8 +164,9 @@ async function sendMessageInner({
   context: deprecatedContext,
   events,
   sender,
+  retryCount,
   ...rest
-}: SendParamsInner): Promise<BackendMessageSendResult> {
+}: SendParamsInner): Promise<SendMessageInnerResult> {
   let context: Record<string, JSONValue>[] | undefined;
   // passing full events is also deprecated
   if (events) {
@@ -181,9 +212,9 @@ async function sendMessageInner({
   }
 
   if (!(journey.status === "Running" || journey.status === "Broadcast")) {
-    return ok({
-      type: InternalEventType.MessageSkipped,
-      message: "Journey is not running",
+    return err({
+      type: InternalEventType.JourneyEarlyExit,
+      message: `Journey is not running: ${journey.status}`,
     });
   }
 
@@ -200,17 +231,50 @@ async function sendMessageInner({
   if (rest.triggeringMessageId) {
     messageTags.triggeringMessageId = rest.triggeringMessageId;
   }
-  const result = await sender({
-    workspaceId,
-    useDraft: false,
-    templateId,
-    userId,
-    userPropertyAssignments,
-    subscriptionGroupDetails,
-    messageTags,
-    ...rest,
-  });
-  return result;
+
+  try {
+    const result = await sender({
+      workspaceId,
+      useDraft: false,
+      templateId,
+      userId,
+      userPropertyAssignments,
+      subscriptionGroupDetails,
+      messageTags,
+      ...rest,
+    });
+    return result;
+  } catch (senderError) {
+    // Check if we're in the final retry attempt
+    const activityInfo = Context.current().info;
+    const isLastAttempt = activityInfo.attempt >= (retryCount ?? 3);
+
+    if (isLastAttempt) {
+      logger().error("sender failed after maximum retry attempts", {
+        workspaceId,
+        userId,
+        messageId,
+        templateId,
+        attempt: activityInfo.attempt,
+        maxAttempts: retryCount,
+        err: senderError,
+      });
+
+      const senderErrorString =
+        senderError instanceof Error
+          ? senderError.message
+          : String(senderError);
+
+      // Return a MessageSkipped result instead of throwing
+      return err({
+        type: InternalEventType.JourneyEarlyExit,
+        message: `Message failed after maximum retry attempts: ${senderErrorString}`,
+      });
+    }
+
+    // Not the final attempt, rethrow to allow retry
+    throw senderError;
+  }
 }
 
 export function sendMessageFactory(sender: Sender) {
@@ -380,6 +444,7 @@ export interface BaseGetSegmentAssignmentParams {
   workspaceId: string;
   segmentId: string;
   userId: string;
+  journeyId?: string;
 }
 
 export interface KeyedGetSegmentAssignmentParamsV1
@@ -463,6 +528,7 @@ export async function getSegmentAssignment(
           },
           {
             userId,
+            journeyId: params.journeyId,
           },
         );
         break;
@@ -659,3 +725,5 @@ export async function reportWorkflowInfo({
   sizeHistogram.record(historySize, attributes);
   lengthHistogram.record(historyLength, attributes);
 }
+
+export { getRandomNumber } from "../../temporal/activities/shared";

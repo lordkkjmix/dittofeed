@@ -5,12 +5,12 @@ import {
   query,
 } from "backend-lib/src/clickhouse";
 import {
-  resetComputePropertiesWorkflows,
   resetGlobalCron,
   startComputePropertiesWorkflow,
   startComputePropertiesWorkflowGlobal,
   stopComputePropertiesWorkflowGlobal,
   terminateComputePropertiesWorkflow,
+  terminateWorkspaceRecomputeWorkflows,
 } from "backend-lib/src/computedProperties/computePropertiesWorkflow/lifecycle";
 import { db, insert } from "backend-lib/src/db";
 import * as schema from "backend-lib/src/db/schema";
@@ -22,8 +22,10 @@ import {
   Workspace,
 } from "backend-lib/src/types";
 import {
+  CREATE_COMPUTED_PROPERTY_STATE_V3_TABLE_QUERY,
   CREATE_INTERNAL_EVENTS_TABLE_MATERIALIZED_VIEW_QUERY,
   CREATE_INTERNAL_EVENTS_TABLE_QUERY,
+  CREATE_UPDATED_COMPUTED_PROPERTY_STATE_V3_MV_QUERY,
   createUserEventsTables,
   GROUP_MATERIALIZED_VIEWS,
   GROUP_TABLES,
@@ -271,6 +273,215 @@ export async function upgradeV021Pre() {
   logger().info("Pre-upgrade steps for v0.21.0 completed.");
 }
 
+export function transferComputedPropertyStateV2ToV3Query({
+  excludeWorkspaceIds,
+  limit,
+  offset,
+  qb,
+}: {
+  excludeWorkspaceIds?: string[];
+  limit: number;
+  offset: number;
+  qb: ClickHouseQueryBuilder;
+}) {
+  const excludeClause =
+    excludeWorkspaceIds && excludeWorkspaceIds.length > 0
+      ? `WHERE workspace_id NOT IN ${qb.addQueryValue(
+          excludeWorkspaceIds,
+          "Array(String)",
+        )}`
+      : "";
+
+  const limitClause = `LIMIT ${qb.addQueryValue(limit, "UInt64")}`;
+  const offsetClause =
+    offset > 0 ? `OFFSET ${qb.addQueryValue(offset, "UInt64")}` : "";
+
+  const workspaceSubquery = `SELECT DISTINCT workspace_id
+    FROM computed_property_state_v2
+    ${excludeClause}
+    ORDER BY workspace_id
+    ${limitClause}
+    ${offsetClause}`;
+
+  return `
+    INSERT INTO computed_property_state_v3
+    SELECT
+      workspace_id,
+      type,
+      computed_property_id,
+      state_id,
+      user_id,
+      last_value,
+      unique_count,
+      event_time,
+      grouped_message_ids,
+      computed_at
+    FROM computed_property_state_v2
+    WHERE
+      workspace_id IN (
+        ${workspaceSubquery}
+      )
+      AND (
+        workspace_id,
+        type,
+        computed_property_id,
+        state_id,
+        user_id,
+        event_time
+      ) NOT IN (
+        SELECT
+          workspace_id,
+          type,
+          computed_property_id,
+          state_id,
+          user_id,
+          event_time
+        FROM computed_property_state_v3
+        WHERE workspace_id IN (
+          ${workspaceSubquery}
+        )
+      )
+  `;
+}
+
+interface TransferComputedPropertyStateV2ToV3Params {
+  excludeWorkspaceIds?: string[];
+  limit?: number;
+  offset?: number;
+  dryRun?: boolean;
+}
+
+export async function transferComputedPropertyStateV2ToV3({
+  excludeWorkspaceIds,
+  limit = 10,
+  offset = 0,
+  dryRun = false,
+}: TransferComputedPropertyStateV2ToV3Params) {
+  if (limit <= 0) {
+    throw new Error("limit must be greater than 0");
+  }
+  if (offset < 0) {
+    throw new Error("offset cannot be negative");
+  }
+
+  logger().info(
+    {
+      excludeWorkspaceIdsCount: excludeWorkspaceIds?.length ?? 0,
+      limit,
+      offset,
+      dryRun,
+    },
+    "Transferring computed_property_state from v2 to v3",
+  );
+
+  let currentOffset = offset;
+  let totalWrittenRows = 0;
+  let batchCount = 0;
+  let lastReadRows = 0;
+
+  while (true) {
+    const qb = new ClickHouseQueryBuilder();
+    const transferQuery = transferComputedPropertyStateV2ToV3Query({
+      excludeWorkspaceIds,
+      limit,
+      offset: currentOffset,
+      qb,
+    }).trim();
+
+    if (dryRun) {
+      const dryRunQuery = transferQuery
+        .replace(
+          /computed_property_state_v3/g,
+          "dittofeed.computed_property_state_v3",
+        )
+        .replace(
+          /computed_property_state_v2/g,
+          "dittofeed.computed_property_state_v2",
+        );
+      logger().info(
+        { query: dryRunQuery, params: qb.getQueries(), currentOffset },
+        "Dry run transfer query",
+      );
+      batchCount += 1;
+      break;
+    }
+
+    const result = await command({
+      query: transferQuery,
+      query_params: qb.getQueries(),
+      clickhouse_settings: { wait_end_of_query: 1 },
+    });
+
+    const { summary } = result;
+    const writtenRows = summary?.written_rows
+      ? parseInt(summary.written_rows)
+      : 0;
+    const readRows = summary?.read_rows ? parseInt(summary.read_rows) : 0;
+    totalWrittenRows += writtenRows;
+    batchCount += 1;
+    lastReadRows = readRows;
+
+    logger().info(
+      {
+        batchIndex: batchCount - 1,
+        currentOffset,
+        limit,
+        writtenRows,
+        readRows,
+      },
+      "Executed computed_property_state transfer batch",
+    );
+
+    if (writtenRows === 0) {
+      break;
+    }
+
+    currentOffset += limit;
+    if (writtenRows === 0) {
+      // No new rows were written for this batch, but there may still be
+      // additional workspaces beyond the current offset. Continue to the next
+      // page to ensure we eventually cover the entire dataset.
+      // eslint-disable-next-line no-continue
+      continue;
+    }
+  }
+
+  const nextOffsetSuggestion = currentOffset + limit;
+
+  logger().info(
+    {
+      totalWrittenRows,
+      batchesExecuted: batchCount,
+      finalOffset: currentOffset,
+      lastReadRows,
+      nextOffsetSuggestion,
+    },
+    "Completed computed_property_state transfer",
+  );
+}
+
+export async function createComputedPropertyStateV3() {
+  logger().info(
+    "Creating computed_property_state_v3 table and materialized view",
+  );
+
+  await Promise.all(
+    [
+      CREATE_COMPUTED_PROPERTY_STATE_V3_TABLE_QUERY,
+      CREATE_UPDATED_COMPUTED_PROPERTY_STATE_V3_MV_QUERY,
+    ].map((queryString) =>
+      command({
+        query: queryString,
+        clickhouse_settings: { wait_end_of_query: 1 },
+      }),
+    ),
+  );
+
+  logger().info(
+    "Finished creating computed_property_state_v3 table and materialized view",
+  );
+}
+
 export async function backfillInternalEvents({
   // defaults to 1 day in minutes
   intervalMinutes = 1440,
@@ -280,6 +491,7 @@ export async function backfillInternalEvents({
   forceFullBackfill = false,
   // defaults to 10000 rows per batch within a time window
   limit = 10000,
+  dryRun = false,
 }: {
   intervalMinutes?: number;
   workspaceIds?: string[];
@@ -287,8 +499,13 @@ export async function backfillInternalEvents({
   endDate?: string;
   forceFullBackfill?: boolean;
   limit?: number;
+  dryRun?: boolean;
 }) {
-  logger().info("Backfilling internal events");
+  logger().info(
+    dryRun
+      ? "Analyzing internal events backfill (dry run)"
+      : "Backfilling internal events",
+  );
 
   // Determine start date
   let startDate: Date;
@@ -527,16 +744,42 @@ export async function backfillInternalEvents({
             AND processing_time >= parseDateTimeBestEffort(${startTimeParam}, 'UTC')
             AND processing_time < parseDateTimeBestEffort(${endTimeParam}, 'UTC')
             ${insertWorkspaceFilter}
+            AND (workspace_id, processing_time, user_or_anonymous_id, event_time, message_id) NOT IN (
+              SELECT
+                workspace_id,
+                processing_time,
+                user_or_anonymous_id,
+                event_time,
+                message_id
+              FROM internal_events
+              WHERE
+                processing_time >= parseDateTimeBestEffort(${startTimeParam}, 'UTC')
+                AND processing_time < parseDateTimeBestEffort(${endTimeParam}, 'UTC')
+                ${insertWorkspaceFilter}
+            )
+          ORDER BY workspace_id, processing_time, user_or_anonymous_id, event_time, message_id
           LIMIT ${limitParam} OFFSET ${offsetParam}
         `;
 
-        const insertResult = await command({
-          query: insertQuery,
-          query_params: insertQb.getQueries(),
-          clickhouse_settings: { wait_end_of_query: 1 },
-        });
-        const writtenRowsString = insertResult.summary?.written_rows;
-        const writtenRows = writtenRowsString ? parseInt(writtenRowsString) : 0;
+        let writtenRows = 0;
+        if (dryRun) {
+          logger().info(
+            {
+              variables: insertQb.getQueries(),
+            },
+            `DRY RUN - Would execute query:\n${insertQuery}`,
+          );
+          // For dry run, we don't know how many rows would be written, so we use the limit
+          writtenRows = limit;
+        } else {
+          const insertResult = await command({
+            query: insertQuery,
+            query_params: insertQb.getQueries(),
+            clickhouse_settings: { wait_end_of_query: 1 },
+          });
+          const writtenRowsString = insertResult.summary?.written_rows;
+          writtenRows = writtenRowsString ? parseInt(writtenRowsString) : 0;
+        }
 
         totalProcessedInChunk += writtenRows;
 
@@ -547,8 +790,11 @@ export async function backfillInternalEvents({
             offset,
             writtenRows,
             totalProcessedInChunk,
+            dryRun,
           },
-          "Batch processed successfully",
+          dryRun
+            ? "Batch analyzed successfully (dry run)"
+            : "Batch processed successfully",
         );
 
         // If we got fewer rows than the limit, we've reached the end of data for this time chunk
@@ -558,8 +804,11 @@ export async function backfillInternalEvents({
               currentStart: currentStart.toISOString(),
               currentEnd: currentEnd.toISOString(),
               totalProcessedInChunk,
+              dryRun,
             },
-            "Completed time chunk - fewer rows than limit",
+            dryRun
+              ? "Completed time chunk analysis - fewer rows than limit (dry run)"
+              : "Completed time chunk - fewer rows than limit",
           );
           break;
         }
@@ -583,7 +832,11 @@ export async function backfillInternalEvents({
     currentStart = currentEnd;
   }
 
-  logger().info("Backfilling internal events completed");
+  logger().info(
+    dryRun
+      ? "Internal events backfill analysis completed (dry run)"
+      : "Backfilling internal events completed",
+  );
 }
 
 export async function addServerTimeColumn() {
@@ -642,9 +895,13 @@ export async function createInternalEventsTable({
 export async function upgradeV023Pre({
   internalEventsBackfillLimit = 50000,
   internalEventsBackfillIntervalMinutes = 1440,
+  stateExcludeWorkspaceId,
+  stateLimit,
 }: {
   internalEventsBackfillLimit?: number;
   internalEventsBackfillIntervalMinutes?: number;
+  stateExcludeWorkspaceId?: string[];
+  stateLimit?: number;
 }) {
   logger().info("Performing pre-upgrade steps for v0.23.0");
   await addServerTimeColumn();
@@ -654,16 +911,20 @@ export async function upgradeV023Pre({
     backfillLimit: internalEventsBackfillLimit,
     intervalMinutes: internalEventsBackfillIntervalMinutes,
   });
+
+  await terminateWorkspaceRecomputeWorkflows();
+  await stopComputePropertiesWorkflowGlobal();
+  await createComputedPropertyStateV3();
+  await transferComputedPropertyStateV2ToV3({
+    excludeWorkspaceIds: stateExcludeWorkspaceId,
+    limit: stateLimit,
+  });
   logger().info("Pre-upgrade steps for v0.23.0 completed.");
 }
 
 export async function upgradeV023Post() {
   logger().info("Performing post-upgrade steps for v0.23.0");
-  await resetComputePropertiesWorkflows({
-    all: true,
-  });
   await resetGlobalCron();
-  await stopComputePropertiesWorkflowGlobal();
   await startComputePropertiesWorkflowGlobal();
   logger().info("Post-upgrade steps for v0.23.0 completed.");
 }

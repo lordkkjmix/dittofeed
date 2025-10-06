@@ -325,25 +325,24 @@ export async function getJourneyMessageStats({
         count(resolved_message_id) AS count
     FROM (
             SELECT
-                JSON_VALUE(message_raw, '$.properties.journeyId') AS journey_id,
-                JSON_VALUE(message_raw, '$.properties.nodeId') AS node_id,
-                JSON_VALUE(message_raw, '$.properties.runId') AS run_id,
+                journey_id,
+                JSON_VALUE(properties, '$.nodeId') AS node_id,
+                JSON_VALUE(properties, '$.runId') AS run_id,
                 if(
                     (
-                        JSON_VALUE(message_raw, '$.properties.messageId') AS property_message_id
+                        JSON_VALUE(properties, '$.messageId') AS property_message_id
                     ) != '',
                     property_message_id,
                     message_id
                 ) AS resolved_message_id,
                 argMax(event, event_time) as last_event
-            FROM user_events_v2
+            FROM internal_events
             WHERE
                 workspace_id = ${qb.addQueryValue(workspaceId, "String")}
                 AND journey_id in ${qb.addQueryValue(
                   journeyIds,
                   "Array(String)",
                 )}
-                AND (event_type = 'track')
                 AND (event in ${qb.addQueryValue(
                   MESSAGE_EVENTS,
                   "Array(String)",
@@ -496,20 +495,16 @@ export async function getJourneysStats({
 
   const query = `
     select
+        journey_id,
         JSON_VALUE(
-            message_raw,
-            '$.properties.journeyId'
-        ) journey_id,
-        JSON_VALUE(
-            message_raw,
-            '$.properties.nodeId'
+            properties,
+            '$.nodeId'
         ) node_id,
         uniq(message_id) as count
-    from user_events_v2
+    from internal_events
     where
         workspace_id = ${workspaceIdQuery}
         and journey_id in ${journeyIdsQuery}
-        and event_type = 'track'
         and event = 'DFJourneyNodeProcessed'
     group by journey_id, node_id
 `;
@@ -679,7 +674,7 @@ export async function getJourneysStats({
         }
         case JourneyNodeType.RateLimitNode:
           continue;
-        case JourneyNodeType.ExperimentSplitNode:
+        case JourneyNodeType.RandomCohortNode:
           continue;
         default:
           assertUnreachable(node);

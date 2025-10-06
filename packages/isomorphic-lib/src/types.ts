@@ -99,6 +99,7 @@ export enum InternalEventType {
   UserTrackSignal = "DFUserTrackSignal",
   GroupUserAssignment = "DFGroupUserAssignment",
   UserGroupAssignment = "DFUserGroupAssignment",
+  JourneyEarlyExit = "DFJourneyEarlyExit",
 }
 
 export const StatusEventsList = [
@@ -334,6 +335,7 @@ export enum SegmentNodeType {
   RandomBucket = "RandomBucket",
   KeyedPerformed = "KeyedPerformed",
   Everyone = "Everyone",
+  Includes = "Includes",
 }
 
 export const DBResourceTypeEnum = {
@@ -504,6 +506,15 @@ export const EveryoneSegmentNode = Type.Object({
 
 export type EveryoneSegmentNode = Static<typeof EveryoneSegmentNode>;
 
+export const IncludesSegmentNode = Type.Object({
+  type: Type.Literal(SegmentNodeType.Includes),
+  id: Type.String(),
+  path: Type.String(),
+  item: Type.String(),
+});
+
+export type IncludesSegmentNode = Static<typeof IncludesSegmentNode>;
+
 export const KeyedPerformedPropertiesOperator = Type.Union([
   SegmentEqualsOperator,
   SegmentNotEqualsOperator,
@@ -548,6 +559,7 @@ export const BodySegmentNode = Type.Union([
   BroadcastSegmentNode,
   SubscriptionGroupSegmentNode,
   RandomBucketSegmentNode,
+  IncludesSegmentNode,
 ]);
 
 export type BodySegmentNode = Static<typeof BodySegmentNode>;
@@ -851,7 +863,7 @@ export enum JourneyNodeType {
   SegmentSplitNode = "SegmentSplitNode",
   MessageNode = "MessageNode",
   RateLimitNode = "RateLimitNode",
-  ExperimentSplitNode = "ExperimentSplitNode",
+  RandomCohortNode = "RandomCohortNode",
   ExitNode = "ExitNode",
   // Inconsistent naming is for backwards compatibility.
   SegmentEntryNode = "EntryNode",
@@ -1143,6 +1155,9 @@ export const MessageNode = Type.Object(
     child: Type.String(),
     syncProperties: Type.Optional(Type.Boolean()),
     skipOnFailure: Type.Optional(Type.Boolean()),
+    retryCount: Type.Optional(
+      Type.Number({ description: "Number of retry attempts (default: 3)" }),
+    ),
   },
   {
     title: "Message Node",
@@ -1183,19 +1198,31 @@ export const SegmentSplitNode = Type.Object(
 
 export type SegmentSplitNode = Static<typeof SegmentSplitNode>;
 
-export const ExperimentSplitNode = Type.Object(
+export const RandomCohortChild = Type.Object({
+  id: Type.String({ description: "The id of the child node to be split to" }),
+  percent: Type.Number({
+    description:
+      "The percentage of users to be randomly assigned to be in the cohort.",
+  }),
+  name: Type.String(),
+});
+
+export type RandomCohortChild = Static<typeof RandomCohortChild>;
+
+export const RandomCohortNode = Type.Object(
   {
     ...BaseNode,
-    type: Type.Literal(JourneyNodeType.ExperimentSplitNode),
+    type: Type.Literal(JourneyNodeType.RandomCohortNode),
+    children: Type.Array(RandomCohortChild),
   },
   {
-    title: "Experiment Split Node",
+    title: "Random Cohort Node",
     description:
-      "Used to split users among experiment paths, to test their effectiveness.",
+      "Used to split users among random cohorts, to test their effectiveness.",
   },
 );
 
-export type ExperimentSplitNode = Static<typeof ExperimentSplitNode>;
+export type RandomCohortNode = Static<typeof RandomCohortNode>;
 
 export const ExitNode = Type.Object(
   {
@@ -1215,7 +1242,7 @@ export const JourneyBodyNode = Type.Union([
   RateLimitNode,
   SegmentSplitNode,
   MessageNode,
-  ExperimentSplitNode,
+  RandomCohortNode,
   WaitForNode,
 ]);
 
@@ -2197,11 +2224,26 @@ export const WaitForUiNodeProps = Type.Object({
 
 export type WaitForUiNodeProps = Static<typeof WaitForUiNodeProps>;
 
+export const RandomCohortUiChild = Type.Object({
+  name: Type.String(),
+  percent: Type.Number(),
+});
+
+export type RandomCohortUiChild = Static<typeof RandomCohortUiChild>;
+
+export const RandomCohortUiNodeProps = Type.Object({
+  type: Type.Literal(JourneyNodeType.RandomCohortNode),
+  cohortChildren: Type.Array(RandomCohortUiChild),
+});
+
+export type RandomCohortUiNodeProps = Static<typeof RandomCohortUiNodeProps>;
+
 export const JourneyUiBodyNodeTypeProps = Type.Union([
   MessageUiNodeProps,
   DelayUiNodeProps,
   SegmentSplitUiNodeProps,
   WaitForUiNodeProps,
+  RandomCohortUiNodeProps,
 ]);
 
 export type JourneyUiBodyNodeTypeProps = Static<

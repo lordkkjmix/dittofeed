@@ -3,7 +3,11 @@ import { Type } from "@sinclair/typebox";
 import { createAdminApiKey } from "backend-lib/src/adminApiKeys";
 import { submitTrackWithTriggers } from "backend-lib/src/apps";
 import { submitBatch } from "backend-lib/src/apps/batch";
-import { bootstrapClickhouse, bootstrapKafka } from "backend-lib/src/bootstrap";
+import {
+  bootstrapBlobStorage,
+  bootstrapClickhouse,
+  bootstrapKafka,
+} from "backend-lib/src/bootstrap";
 import {
   clickhouseClient,
   ClickHouseQueryBuilder,
@@ -22,8 +26,10 @@ import {
   stopComputePropertiesWorkflow,
   stopComputePropertiesWorkflowGlobal,
   terminateComputePropertiesWorkflow,
+  terminateWorkspaceRecomputeWorkflows,
 } from "backend-lib/src/computedProperties/computePropertiesWorkflow/lifecycle";
 import {
+  buildFindDueWorkspaceMinTosQuery,
   findDueWorkspaceMaxTos,
   findDueWorkspaceMinTos,
 } from "backend-lib/src/computedProperties/periods";
@@ -55,6 +61,7 @@ import { randomUUID } from "crypto";
 import { and, eq, inArray } from "drizzle-orm";
 import fs from "fs/promises";
 import { SecretNames } from "isomorphic-lib/src/constants";
+import { parseInt as parseIntStrict } from "isomorphic-lib/src/numbers";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import {
   jsonParseSafeWithSchema,
@@ -86,6 +93,8 @@ import { spawnWithEnv } from "./spawn";
 import {
   backfillInternalEvents,
   disentangleResendSendgrid,
+  transferComputedPropertyStateV2ToV3,
+  transferComputedPropertyStateV2ToV3Query,
   upgradeV010Post,
   upgradeV010Pre,
   upgradeV012Pre,
@@ -94,6 +103,30 @@ import {
   upgradeV023Pre,
 } from "./upgrades";
 
+function formatSqlParam(value: unknown): string {
+  if (value === null || value === undefined) {
+    return "NULL";
+  }
+  if (typeof value === "number" || typeof value === "bigint") {
+    return value.toString();
+  }
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+  if (value instanceof Date) {
+    return `'${value.toISOString()}'`;
+  }
+  if (Array.isArray(value)) {
+    return `(${value.map((item) => formatSqlParam(item)).join(", ")})`;
+  }
+  if (value instanceof Buffer) {
+    return `'\\x${value.toString("hex")}'`;
+  }
+  const serialized = String(value);
+  const escaped = serialized.replace(/'/g, "''");
+  return `'${escaped}'`;
+}
+
 export function createCommands(yargs: Argv): Argv {
   return yargs
     .command(
@@ -101,6 +134,146 @@ export function createCommands(yargs: Argv): Argv {
       "Initialize the dittofeed application and creates a workspace.",
       boostrapOptions,
       bootstrapHandler,
+    )
+    .command(
+      "print-transfer-computed-property-state-v2-v3-query",
+      "Prints the ClickHouse query used to copy computed_property_state_v2 rows into computed_property_state_v3.",
+      (cmd) =>
+        cmd
+          .option("state-exclude-workspace-id", {
+            type: "string",
+            describe:
+              "Workspace ID to exclude from the state transfer (repeatable).",
+            array: true,
+          })
+          .option("state-limit", {
+            type: "number",
+            describe:
+              "Maximum number of distinct workspaces to include per state transfer batch (default 64).",
+            default: 64,
+          })
+          .option("state-offset", {
+            type: "number",
+            describe:
+              "Number of distinct workspaces to skip before selecting the state transfer batch (default 0).",
+            default: 0,
+          }),
+      ({ stateExcludeWorkspaceId, stateLimit, stateOffset }) => {
+        let excludeWorkspaceIds: string[] | undefined;
+        if (Array.isArray(stateExcludeWorkspaceId)) {
+          excludeWorkspaceIds = stateExcludeWorkspaceId.filter(
+            (id): id is string => typeof id === "string" && id.length > 0,
+          );
+        }
+
+        const parsedStateLimit = parseIntStrict(String(stateLimit));
+        if (parsedStateLimit <= 0) {
+          throw new Error("state-limit must be a positive number");
+        }
+
+        const parsedStateOffset = parseIntStrict(String(stateOffset));
+        if (parsedStateOffset < 0) {
+          throw new Error("state-offset must be a non-negative number");
+        }
+
+        logger().info(
+          {
+            excludeWorkspaceIds,
+            stateLimit: parsedStateLimit,
+            stateOffset: parsedStateOffset,
+          },
+          "Building transfer computed property state query",
+        );
+
+        const qb = new ClickHouseQueryBuilder({ debug: true });
+        const queryString = transferComputedPropertyStateV2ToV3Query({
+          excludeWorkspaceIds,
+          limit: parsedStateLimit,
+          offset: parsedStateOffset,
+          qb,
+        });
+        const productionQuery = queryString
+          .replace(
+            /computed_property_state_v3/g,
+            "dittofeed.computed_property_state_v3",
+          )
+          .replace(
+            /computed_property_state_v2/g,
+            "dittofeed.computed_property_state_v2",
+          );
+
+        console.log(productionQuery.trim());
+      },
+    )
+    .command(
+      "print-find-due-workspace-min-tos-query",
+      "Prints the SQL used to find workspaces due for computed property recomputation (min_tos variant).",
+      (cmd) =>
+        cmd
+          .option("now", {
+            type: "number",
+            describe:
+              "Unix timestamp in milliseconds to use as the reference time (defaults to current time).",
+          })
+          .option("interval", {
+            type: "number",
+            describe:
+              "Recompute interval in milliseconds (defaults to computePropertiesInterval).",
+          })
+          .option("limit", {
+            type: "number",
+            describe: "Maximum number of workspaces to return (default 100).",
+          }),
+      ({ now: nowOption, interval: intervalOption, limit: limitOption }) => {
+        const defaultInterval = backendConfig().computePropertiesInterval;
+        const resolvedNow =
+          nowOption !== undefined
+            ? parseIntStrict(String(nowOption))
+            : Date.now();
+        const resolvedInterval =
+          intervalOption !== undefined
+            ? parseIntStrict(String(intervalOption))
+            : defaultInterval;
+        const resolvedLimit =
+          limitOption !== undefined ? parseIntStrict(String(limitOption)) : 100;
+
+        if (resolvedInterval <= 0) {
+          throw new Error("interval must be a positive number");
+        }
+        if (resolvedLimit <= 0) {
+          throw new Error("limit must be a positive number");
+        }
+
+        logger().info(
+          {
+            interval: resolvedInterval,
+            limit: resolvedLimit,
+            now: resolvedNow,
+          },
+          "Building find due workspace min_tos query",
+        );
+
+        const query = buildFindDueWorkspaceMinTosQuery({
+          now: resolvedNow,
+          interval: resolvedInterval,
+          limit: resolvedLimit,
+        });
+
+        const { sql: querySql, params } = query.toSQL();
+        const interpolated = querySql.replace(
+          /\$(\d+)/g,
+          (_match, index: string) => {
+            const paramIndex = Number.parseInt(index, 10) - 1;
+            const param = params[paramIndex];
+            if (paramIndex < 0 || param === undefined) {
+              throw new Error(`Missing parameter for placeholder $${index}`);
+            }
+            return formatSqlParam(param);
+          },
+        );
+
+        console.log(interpolated.trim());
+      },
     )
     .command(
       "bootstrap-worker",
@@ -122,6 +295,14 @@ export function createCommands(yargs: Argv): Argv {
       (y) => y,
       async () => {
         await bootstrapClickhouse();
+      },
+    )
+    .command(
+      "bootstrap-blob-storage",
+      "Bootstraps blob storage.",
+      (y) => y,
+      async () => {
+        await bootstrapBlobStorage();
       },
     )
     .command(
@@ -303,6 +484,15 @@ export function createCommands(yargs: Argv): Argv {
             );
           }),
         );
+        logger().info("Done.");
+      },
+    )
+    .command(
+      "terminate-workspace-recompute-workflows",
+      "Terminates deprecated per-workspace computed property workflows by iterating all workspaces.",
+      (y) => y,
+      async () => {
+        await terminateWorkspaceRecomputeWorkflows();
         logger().info("Done.");
       },
     )
@@ -593,6 +783,30 @@ export function createCommands(yargs: Argv): Argv {
       },
     )
     .command(
+      "transfer-computed-property-state-v2-to-v3",
+      "Transfer computed property state from v2 to v3 table.",
+      (cmd) =>
+        cmd.options({
+          "state-exclude-workspace-id": {
+            type: "string",
+            alias: "e",
+            array: true,
+          },
+          "state-limit": {
+            type: "number",
+            alias: "l",
+            default: 10,
+            describe: "The limit for the state transfer. Default is 10.",
+          },
+        }),
+      async ({ stateExcludeWorkspaceId, stateLimit }) => {
+        await transferComputedPropertyStateV2ToV3({
+          excludeWorkspaceIds: stateExcludeWorkspaceId,
+          limit: stateLimit,
+        });
+      },
+    )
+    .command(
       "upgrade-0-23-0-pre",
       "Run the pre-upgrade steps for the 0.23.0 prior to updating your Dittofeed application version.",
       (cmd) =>
@@ -611,14 +825,30 @@ export function createCommands(yargs: Argv): Argv {
             describe:
               "The interval in minutes for the internal events backfill. Default is 1 day.",
           },
+          "state-exclude-workspace-id": {
+            type: "string",
+            alias: "e",
+            array: true,
+            describe: "Workspace ID to exclude from the state transfer.",
+          },
+          "state-limit": {
+            type: "number",
+            alias: "l",
+            default: 10,
+            describe: "The limit for the state transfer. Default is 10.",
+          },
         }),
       async ({
         internalEventsBackfillLimit,
         internalEventsBackfillIntervalMinutes,
+        stateExcludeWorkspaceId,
+        stateLimit,
       }) => {
         await upgradeV023Pre({
           internalEventsBackfillLimit,
           internalEventsBackfillIntervalMinutes,
+          stateExcludeWorkspaceId,
+          stateLimit,
         });
       },
     )
@@ -675,6 +905,12 @@ export function createCommands(yargs: Argv): Argv {
             describe:
               "Number of rows to process per batch within each time window (default: 10000)",
           },
+          "dry-run": {
+            type: "boolean",
+            alias: "d",
+            default: false,
+            describe: "Only log the insert queries without executing them",
+          },
         }),
       async ({
         intervalMinutes,
@@ -683,6 +919,7 @@ export function createCommands(yargs: Argv): Argv {
         endDate,
         forceFullBackfill,
         limit,
+        dryRun,
       }) => {
         await backfillInternalEvents({
           intervalMinutes,
@@ -691,6 +928,7 @@ export function createCommands(yargs: Argv): Argv {
           endDate,
           forceFullBackfill,
           limit,
+          dryRun,
         });
       },
     )
@@ -1545,6 +1783,7 @@ export function createCommands(yargs: Argv): Argv {
           "start-date": { type: "string", alias: "s" },
           "end-date": { type: "string", alias: "ed" },
           limit: { type: "number", alias: "l", default: 100 },
+          "message-id": { type: "string", alias: "m", array: true },
           offset: { type: "number", alias: "o", default: 0 },
         }),
       async ({
@@ -1558,6 +1797,7 @@ export function createCommands(yargs: Argv): Argv {
         endDate,
         limit,
         offset,
+        messageId,
       }) => {
         const debugQb = new ClickHouseQueryBuilder({ debug: true });
         const { query } = await buildUserEventsQuery(
@@ -1569,6 +1809,7 @@ export function createCommands(yargs: Argv): Argv {
             broadcastId,
             eventType,
             event,
+            messageId,
             userId,
             startDate: startDate ? new Date(startDate).getTime() : undefined,
             endDate: endDate ? new Date(endDate).getTime() : undefined,

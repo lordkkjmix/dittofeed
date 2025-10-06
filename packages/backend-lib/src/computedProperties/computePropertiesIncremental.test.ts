@@ -129,7 +129,7 @@ async function readDisaggregatedStates({
       groupArrayMerge(grouped_message_ids) as grouped_message_ids,
       computed_at,
       event_time
-    from computed_property_state_v2
+    from computed_property_state_v3
     where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
     group by
       workspace_id,
@@ -168,7 +168,7 @@ async function readStates({
       groupArrayMerge(grouped_message_ids) as grouped_message_ids,
       max(computed_at),
       groupArray(event_time) as event_times
-    from computed_property_state_v2
+    from computed_property_state_v3
     where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
     group by
       workspace_id,
@@ -7134,6 +7134,121 @@ describe("computeProperties", () => {
       ],
     },
     {
+      description: "computes an includes segment",
+      segments: [
+        {
+          name: "includes",
+          definition: {
+            entryNode: {
+              type: SegmentNodeType.Includes,
+              id: "1",
+              item: "test2",
+              path: "items1",
+            },
+            nodes: [],
+          },
+        },
+      ],
+      steps: [
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                items1: ["test1", "test2", "test3"],
+              },
+            },
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-2",
+              traits: {
+                items1: ["test4", "test5", "test6"],
+              },
+            },
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-3",
+              traits: {
+                items2: ["test1", "test2", "test3"],
+              },
+            },
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-4",
+              traits: {
+                items1: "invalid",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                includes: true,
+              },
+            },
+            {
+              id: "user-2",
+              segments: {
+                includes: null,
+              },
+            },
+            {
+              id: "user-3",
+              segments: {
+                includes: null,
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                items1: [],
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "user is no longer in the segment after its array is updated",
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                includes: null,
+              },
+            },
+          ],
+        },
+      ],
+    },
+    {
       description: "computes a negative trait segment",
       userProperties: [],
       segments: [
@@ -8105,9 +8220,18 @@ describe("computeProperties", () => {
                   }
                   return s;
                 });
-                expect(simplifiedPeriods, step.description).toEqual(
-                  step.periods,
-                );
+                if (step.periods) {
+                  expect(
+                    simplifiedPeriods,
+                    "should have the same number of periods as expected",
+                  ).toHaveLength(step.periods.length);
+
+                  for (const expected of step.periods) {
+                    expect(simplifiedPeriods, step.description).toContainEqual(
+                      expected,
+                    );
+                  }
+                }
               })()
             : null;
           const resolvedSegmentStatesAssertions = step.resolvedSegmentStates

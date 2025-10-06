@@ -128,6 +128,53 @@ export const GROUP_MATERIALIZED_VIEWS = [
   `,
 ];
 
+export const CREATE_COMPUTED_PROPERTY_STATE_V3_TABLE_QUERY = `
+    CREATE TABLE IF NOT EXISTS computed_property_state_v3 (
+      workspace_id LowCardinality(String),
+      type Enum('user_property' = 1, 'segment' = 2),
+      computed_property_id LowCardinality(String),
+      state_id LowCardinality(String),
+      user_id String,
+      last_value AggregateFunction(argMax, String, DateTime64(3)),
+      unique_count AggregateFunction(uniq, String),
+      event_time DateTime64(3),
+      grouped_message_ids AggregateFunction(groupArray, String),
+      computed_at DateTime64(3)
+    )
+    ENGINE = AggregatingMergeTree()
+    PARTITION BY (
+      workspace_id,
+      toYear(event_time)
+    )
+    ORDER BY (
+      workspace_id,
+      type,
+      computed_property_id,
+      state_id,
+      user_id,
+      event_time
+    );
+  `;
+
+export const CREATE_UPDATED_COMPUTED_PROPERTY_STATE_V3_MV_QUERY = `
+  create materialized view if not exists updated_computed_property_state_v3_mv to updated_computed_property_state
+  as select
+    workspace_id,
+    type,
+    computed_property_id,
+    state_id,
+    user_id,
+    computed_at
+  from computed_property_state_v3
+  group by
+    workspace_id,
+    type,
+    computed_property_id,
+    state_id,
+    user_id,
+    computed_at;
+`;
+
 // TODO route through kafka
 export async function insertProcessedComputedProperties({
   assignments,
@@ -144,7 +191,8 @@ export async function insertProcessedComputedProperties({
 
 export async function createUserEventsTables() {
   logger().info("Creating user events tables");
-  const queries: string[] = [
+
+  const queries = [
     // This is the primary table for user events, which serves as the source of truth for user traits and behaviors.
     `
         CREATE TABLE IF NOT EXISTS user_events_v2 (
@@ -223,29 +271,7 @@ export async function createUserEventsTables() {
     // pieces of state, typically ~1 per segment or user property "node". For
     // example, a segment with N conditions joined with an "And" clause will
     // require N state id's.
-    `
-        CREATE TABLE IF NOT EXISTS computed_property_state_v2 (
-          workspace_id LowCardinality(String),
-          type Enum('user_property' = 1, 'segment' = 2),
-          computed_property_id LowCardinality(String),
-          state_id LowCardinality(String),
-          user_id String,
-          last_value AggregateFunction(argMax, String, DateTime64(3)),
-          unique_count AggregateFunction(uniq, String),
-          event_time DateTime64(3),
-          grouped_message_ids AggregateFunction(groupArray, String),
-          computed_at DateTime64(3)
-        )
-        ENGINE = AggregatingMergeTree()
-        ORDER BY (
-          workspace_id,
-          type,
-          computed_property_id,
-          state_id,
-          user_id,
-          event_time
-        );
-      `,
+    CREATE_COMPUTED_PROPERTY_STATE_V3_TABLE_QUERY,
     // This table stores the assignments of computed properties to users, json
     // strings in the case of user properties or booleans in the case of
     // segments.
@@ -380,6 +406,23 @@ export async function createUserEventsTables() {
     ...GROUP_TABLES,
   ];
 
+  // Only create cold storage table if enabled in config
+  if (config().enableColdStorage) {
+    queries.push(`
+        CREATE TABLE IF NOT EXISTS user_events_cold_storage (
+          message_raw String,
+          processing_time DateTime64(3),
+          workspace_id String,
+          message_id String,
+          server_time DateTime64(3)
+        )
+        ENGINE = MergeTree()
+        PARTITION BY (workspace_id, toYYYYMM(processing_time))
+        ORDER BY (workspace_id, processing_time, message_id)
+        SETTINGS storage_policy = 'cold_storage'
+      `);
+  }
+
   await Promise.all(
     queries.map((query) =>
       clickhouseClient().exec({
@@ -408,24 +451,7 @@ export async function createUserEventsTables() {
         user_id,
         assigned_at;
     `,
-    `
-      create materialized view if not exists updated_computed_property_state_v2_mv to updated_computed_property_state
-      as select
-        workspace_id,
-        type,
-        computed_property_id,
-        state_id,
-        user_id,
-        computed_at
-      from computed_property_state_v2
-      group by
-        workspace_id,
-        type,
-        computed_property_id,
-        state_id,
-        user_id,
-        computed_at;
-    `,
+    CREATE_UPDATED_COMPUTED_PROPERTY_STATE_V3_MV_QUERY,
     // Materialized view that populates internal_events table with DF-prefixed track events
     CREATE_INTERNAL_EVENTS_TABLE_MATERIALIZED_VIEW_QUERY,
     ...GROUP_MATERIALIZED_VIEWS,

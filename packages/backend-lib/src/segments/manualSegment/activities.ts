@@ -1,7 +1,6 @@
 import { and, eq } from "drizzle-orm";
 import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
 import { getNewManualSegmentVersion } from "isomorphic-lib/src/segments";
-import { sleep } from "isomorphic-lib/src/time";
 import {
   BatchItem,
   EventType,
@@ -11,18 +10,59 @@ import {
   SegmentDefinition,
   SegmentNodeType,
 } from "isomorphic-lib/src/types";
+import pRetry from "p-retry";
 import { v5 as uuidv5, validate as validateUuid } from "uuid";
 
 import { submitBatch } from "../../apps/batch";
-import {
-  computePropertiesIncremental,
-  computePropertiesIncrementalArgs,
-} from "../../computedProperties/computePropertiesWorkflow/activities";
+import { computePropertiesIncremental } from "../../computedProperties/computePropertiesWorkflow/activities";
+import { enqueueRecompute } from "../../computedProperties/computePropertiesWorkflow/lifecycle";
 import { db } from "../../db";
 import * as schema from "../../db/schema";
+import { findAllIntegrationResources } from "../../integrations";
+import { findRunningJourneys, getSubscribedSegments } from "../../journeys";
 import logger from "../../logger";
 import { toSegmentResource } from "../../segments";
+import { getContext } from "../../temporal/activity";
 import { Segment } from "../../types";
+import { getEventsCountById } from "../../userEvents";
+import { findAllUserPropertyResources } from "../../userProperties";
+
+async function waitForEventAvailability({
+  workspaceId,
+  segmentId,
+  messageIds,
+}: {
+  workspaceId: string;
+  segmentId: string;
+  messageIds: string[];
+}) {
+  const expectedCount = messageIds.length;
+  // Wait for events to be processed with exponential retry
+  await pRetry(
+    async () => {
+      const actualCount = await getEventsCountById({
+        workspaceId,
+        eventIds: messageIds,
+      });
+      logger().debug(
+        { expectedCount, actualCount, segmentId, workspaceId },
+        "Checking event count for manual segment",
+      );
+      if (actualCount < expectedCount) {
+        throw new Error(
+          `Expected ${expectedCount} events, but found ${actualCount}`,
+        );
+      }
+    },
+    // 1s + 2s + 4s + 8s + 16s + 30s + 30s + 30s + 30s + 30s = 181 seconds or ~3 minutes < 5 minute activity timeout
+    {
+      retries: 10,
+      minTimeout: 1000, // 1 second
+      maxTimeout: 30000, // 30 seconds max per retry
+      factor: 2,
+    },
+  );
+}
 
 async function computePropertiesForManualSegment({
   workspaceId,
@@ -33,15 +73,54 @@ async function computePropertiesForManualSegment({
   segment: SavedSegmentResource;
   now: number;
 }) {
-  const args = await computePropertiesIncrementalArgs({
+  // Enqueue a follow-up full workspace recompute through the queue workflow
+  const { workflowClient } = getContext();
+  await enqueueRecompute({
+    items: [{ id: workspaceId }],
+    client: workflowClient,
+  });
+
+  // Gather dependencies for targeted recompute: subscribed journeys, integrations, and core user properties
+  const [journeys, integrations, userProperties] = await Promise.all([
+    findRunningJourneys({ workspaceId }),
+    findAllIntegrationResources({ workspaceId }),
+    findAllUserPropertyResources({
+      workspaceId,
+      names: ["id", "anonymousId"],
+    }),
+  ]);
+
+  const subscribedJourneys = journeys.filter((j) =>
+    getSubscribedSegments(j.definition).has(segment.id),
+  );
+
+  const subscribedIntegrations = integrations.flatMap((i) => {
+    if (i.isErr()) {
+      logger().error(
+        { err: i.error, workspaceId, segmentId: segment.id },
+        "failed to parse integration for manual segment recompute",
+      );
+      return [];
+    }
+    return i.value.definition.subscribedSegments.includes(segment.id)
+      ? [i.value]
+      : [];
+  });
+
+  // Synchronously recompute only the passed segment (with its dependencies)
+  const args = {
     workspaceId,
-  });
-  args.segments.push(segment);
-  logger().debug(args, "recomputing properties for manual segment");
-  await computePropertiesIncremental({
-    ...args,
+    segments: [segment],
+    userProperties,
+    journeys: subscribedJourneys,
+    integrations: subscribedIntegrations,
     now,
-  });
+  };
+  logger().info(
+    { workspaceId, segmentId: segment.id },
+    "recomputing properties for manual segment (targeted)",
+  );
+  await computePropertiesIncremental(args);
 }
 
 function getManualSegmentDefinition(
@@ -155,8 +234,15 @@ export async function appendToManualSegment({
     },
     {
       processingTime: now,
+      // Ensure producer-side processing_time is respected by forcing ch-sync
+      writeModeOverride: "ch-sync",
     },
   );
+  await waitForEventAvailability({
+    workspaceId,
+    segmentId,
+    messageIds: batch.map((b) => b.messageId),
+  });
   const segmentResource = toSegmentResource(segment);
   if (segmentResource.isErr()) {
     logger().error(
@@ -278,8 +364,15 @@ export async function replaceManualSegment({
     },
     {
       processingTime: now,
+      // Ensure producer-side processing_time is respected by forcing ch-sync
+      writeModeOverride: "ch-sync",
     },
   );
+  await waitForEventAvailability({
+    workspaceId,
+    segmentId,
+    messageIds: batch.map((b) => b.messageId),
+  });
   const segmentResource = toSegmentResource(updated);
   if (segmentResource.isErr()) {
     logger().error(

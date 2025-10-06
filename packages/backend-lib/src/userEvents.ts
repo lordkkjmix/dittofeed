@@ -4,6 +4,7 @@ import { format } from "date-fns";
 import { and, eq } from "drizzle-orm";
 import { arrayDefault } from "isomorphic-lib/src/arrays";
 import { ok, Result } from "neverthrow";
+import { sortBy } from "remeda";
 
 import {
   clickhouseClient,
@@ -27,6 +28,7 @@ import {
   JSONValue,
   UserEvent,
   UserWorkflowTrackEvent,
+  WriteMode,
 } from "./types";
 
 export interface InsertUserEvent {
@@ -85,12 +87,11 @@ async function insertUserEventsDirect({
   });
 }
 
-export async function insertUserEvents({
-  workspaceId,
-  userEvents,
-  events,
-}: InsertUserEventsParams): Promise<void> {
-  const { userEventsTopicName, writeMode } = config();
+export async function insertUserEvents(
+  { workspaceId, userEvents, events }: InsertUserEventsParams,
+  options?: { writeModeOverride?: WriteMode },
+): Promise<void> {
+  const { userEventsTopicName } = config();
   const userEventsWithDefault: InsertUserEventInternal[] = arrayDefault(
     userEvents,
     events,
@@ -102,7 +103,9 @@ export async function insertUserEvents({
         : JSON.stringify(e.messageRaw),
   }));
 
-  switch (writeMode) {
+  const effectiveWriteMode = options?.writeModeOverride ?? config().writeMode;
+
+  switch (effectiveWriteMode) {
     // TODO migrate over to new table structure
     case "kafka": {
       await (
@@ -337,12 +340,37 @@ function buildUserEventQueryClauses(
     : "";
 
   let messageIdClause = "";
+  let orderByClause = "";
   if (messageId) {
+    let messageIdWhereClause: string;
     if (typeof messageId === "string") {
-      messageIdClause = `AND message_id = ${qb.addQueryValue(messageId, "String")}`;
+      messageIdWhereClause = `AND message_id = ${qb.addQueryValue(messageId, "String")}`;
     } else {
-      messageIdClause = `AND message_id IN ${qb.addQueryValue(messageId, "Array(String)")}`;
+      messageIdWhereClause = `AND message_id IN ${qb.addQueryValue(messageId, "Array(String)")}`;
     }
+    // using an inner query allows us to take advantage of the skip index on
+    // message_id and dedup events with the same message id
+    messageIdClause = `
+      AND (workspace_id, processing_time, user_or_anonymous_id, event_time, message_id) IN (
+        SELECT
+          workspace_id,
+          max(processing_time),
+          user_or_anonymous_id,
+          argMax(event_time, processing_time),
+          message_id
+        FROM user_events_v2
+        WHERE
+          ${workspaceIdClause}
+          ${messageIdWhereClause}
+        GROUP BY
+          workspace_id,
+          user_or_anonymous_id,
+          message_id
+      )
+    `;
+  }
+  if (!messageIdClause.length) {
+    orderByClause = "ORDER BY processing_time DESC";
   }
 
   const searchClause = searchTerm
@@ -433,6 +461,7 @@ function buildUserEventQueryClauses(
     eventTypeClause,
     hasInternalEventFilters,
     internalEventsConditions,
+    orderByClause,
   };
 }
 
@@ -471,6 +500,7 @@ function buildUserEventInnerQuery(
     messageIdClause,
     hasInternalEventFilters,
     internalEventsConditions,
+    orderByClause,
   } = clauses;
 
   const contextField = includeContext
@@ -511,7 +541,7 @@ function buildUserEventInnerQuery(
         ${eventClause}
         ${eventTypeClause}
         ${messageIdClause}
-      ORDER BY processing_time DESC
+      ${orderByClause}
     `;
   }
 
@@ -549,7 +579,7 @@ function buildUserEventInnerQuery(
       ${journeyIdClause}
       ${eventTypeClause}
       ${messageIdClause}
-    ORDER BY processing_time DESC
+    ${orderByClause}
   `;
 }
 
@@ -610,6 +640,12 @@ export async function findUserEvents({
 }: GetEventsRequest & { abortSignal?: AbortSignal }): Promise<
   UserEventsWithTraits[]
 > {
+  if (Array.isArray(messageId) && messageId.length === 0) {
+    return [];
+  }
+  if (event && event.length === 0) {
+    return [];
+  }
   const qb = new ClickHouseQueryBuilder();
   const { query: eventsQuery, queryParams } = await buildUserEventsQuery(
     {
@@ -638,7 +674,16 @@ export async function findUserEvents({
   });
   logger().debug({ eventsQuery, queryParams }, "findUserEvents query");
 
-  return await eventsResultSet.json<UserEventsWithTraits>();
+  const results = await eventsResultSet.json<UserEventsWithTraits>();
+  // if we're filtering by message id, we do the sorting in memory to avoid expensive sorting in the query
+  const hasMessageIdFilter = (messageId?.length ?? 0) > 0;
+  if (hasMessageIdFilter) {
+    return results;
+  }
+  return sortBy(results, [
+    (r) => new Date(r.processing_time).getTime(),
+    "desc",
+  ]);
 }
 
 export async function findUserEventCount({
@@ -914,7 +959,6 @@ export async function findUserEventsById({
         JSONExtractRaw(message_raw, 'properties') AS properties
     FROM user_events_v2
     WHERE ${whereClause}
-    ORDER BY processing_time DESC
   `;
 
   const resultSet = await chQuery({
@@ -923,7 +967,12 @@ export async function findUserEventsById({
     query_params: qb.getQueries(),
   });
 
-  return await resultSet.json<UserEventsWithTraits>();
+  const results = await resultSet.json<UserEventsWithTraits>();
+  // sort by processing time descending
+  return sortBy(results, [
+    (r) => new Date(r.processing_time).getTime(),
+    "desc",
+  ]);
 }
 
 export interface GetEventsByIdParams {
@@ -931,7 +980,17 @@ export interface GetEventsByIdParams {
   eventIds: string[];
 }
 
-export async function getEventsById({
+export async function getEventsCountById({
+  workspaceId,
+  eventIds,
+}: GetEventsByIdParams): Promise<number> {
+  return await findUserEventCount({
+    workspaceId,
+    messageId: eventIds,
+  });
+}
+
+export async function getTrackEventsById({
   workspaceId,
   eventIds,
 }: GetEventsByIdParams): Promise<UserWorkflowTrackEvent[]> {
@@ -939,6 +998,7 @@ export async function getEventsById({
     workspaceId,
     messageId: eventIds,
     includeContext: true,
+    limit: eventIds.length,
   });
   return events.flatMap((event) => {
     if (event.event_type !== EventType.Track) {

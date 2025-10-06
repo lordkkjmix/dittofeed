@@ -258,6 +258,9 @@ export async function createPeriods({
     return;
   }
 
+  const insertedComputedPropertyIds = newPeriods.map(
+    (p) => p.computedPropertyId,
+  );
   await db().transaction(async (tx) => {
     await tx
       .insert(dbComputedPropertyPeriod)
@@ -270,6 +273,10 @@ export async function createPeriods({
         and(
           eq(dbComputedPropertyPeriod.workspaceId, workspaceId),
           eq(dbComputedPropertyPeriod.step, step),
+          inArray(
+            dbComputedPropertyPeriod.computedPropertyId,
+            insertedComputedPropertyIds,
+          ),
           lt(dbComputedPropertyPeriod.to, new Date(now - 60 * 1000 * 5)),
         ),
       );
@@ -440,6 +447,130 @@ export async function findDueWorkspaceMaxTos({
   return periodsQuery;
 }
 
+export interface FindDueWorkspaceMinTosQueryParams {
+  now: number;
+  interval: number;
+  limit: number;
+}
+
+export function buildFindDueWorkspaceMinTosQuery({
+  now,
+  interval,
+  limit,
+}: FindDueWorkspaceMinTosQueryParams) {
+  const w = aliasedTable(schema.workspace, "w");
+  const cpp = aliasedTable(schema.computedPropertyPeriod, "cpp");
+  const secondsInterval = `${Math.floor(interval / 1000).toString()} seconds`;
+  const timestampNow = Math.floor(now / 1000);
+  const database = db();
+
+  // Build a subquery that computes MAX(to) per running computed property
+  // for step ComputeAssignments, restricted to the property's current version.
+  const maxPerComputedProperty = database
+    .select({
+      workspaceId: cpp.workspaceId,
+      type: cpp.type,
+      computedPropertyId: cpp.computedPropertyId,
+      maxTo: max(cpp.to).as("maxTo"),
+    })
+    .from(cpp)
+    .leftJoin(
+      dbSegment,
+      and(
+        eq(cpp.computedPropertyId, dbSegment.id),
+        eq(cpp.type, "Segment"),
+        eq(dbSegment.status, "Running"),
+      ),
+    )
+    .leftJoin(
+      dbUserProperty,
+      and(
+        eq(cpp.computedPropertyId, dbUserProperty.id),
+        eq(cpp.type, "UserProperty"),
+        eq(dbUserProperty.status, "Running"),
+      ),
+    )
+    .where(
+      and(
+        eq(cpp.step, ComputedPropertyStepEnum.ComputeAssignments),
+        // Only consider the current version for the property
+        eq(
+          cpp.version,
+          sql`round(extract(epoch from COALESCE(${dbSegment.definitionUpdatedAt}, ${dbUserProperty.definitionUpdatedAt})) * 1000)::text`,
+        ),
+      ),
+    )
+    .groupBy(cpp.workspaceId, cpp.type, cpp.computedPropertyId)
+    .as("maxPerComputedProperty");
+
+  const aggregatedMin = min(maxPerComputedProperty.maxTo);
+  const whereConditions: (SQL | undefined)[] = [
+    eq(w.status, WorkspaceStatusDbEnum.Active),
+    not(eq(w.type, WorkspaceTypeAppEnum.Parent)),
+    // Only include workspaces with at least one running Segment or UserProperty
+    or(
+      inArray(
+        w.id,
+        database
+          .select({ id: dbSegment.workspaceId })
+          .from(dbSegment)
+          .where(eq(dbSegment.status, "Running")),
+      ),
+      inArray(
+        w.id,
+        database
+          .select({ id: dbUserProperty.workspaceId })
+          .from(dbUserProperty)
+          .where(eq(dbUserProperty.status, "Running")),
+      ),
+    ),
+  ];
+
+  // Outer query: MIN of per-property MAX(to) per workspace
+  return database
+    .select({
+      workspaceId: w.id,
+      min: aggregatedMin,
+    })
+    .from(w)
+    .leftJoin(
+      maxPerComputedProperty,
+      eq(maxPerComputedProperty.workspaceId, w.id),
+    )
+    .where(and(...whereConditions))
+    .groupBy(w.id)
+    .having(
+      or(
+        // Cold start: no latest rows for this workspace
+        sql`${aggregatedMin} IS NULL`,
+        // Overdue: earliest of latest per-property periods is older than interval
+        sql`(to_timestamp(${timestampNow}) - ${aggregatedMin}) > ${secondsInterval}::interval`,
+      ),
+    )
+    .orderBy(sql`${aggregatedMin} ASC NULLS FIRST`)
+    .limit(limit);
+}
+
+/**
+ * Find workspaces that are due for recomputation based on computed-property periods.
+ *
+ * Semantics:
+ * - For each running computed property (Segment or UserProperty) in a workspace, consider
+ *   only the current version and the ComputeAssignments step, and compute its latest period
+ *   end time: MAX(to).
+ * - For the workspace, take the MIN over these per‑property MAX(to) values. This represents
+ *   the "earliest last recompute" across all current, running properties.
+ * - A workspace is due if:
+ *   - It is a cold start (no periods yet) OR
+ *   - now - MIN(MAX(to) per property) > interval
+ *
+ * Rationale:
+ * - Using MIN over raw rows can incorrectly mark workspaces as due when an older retained
+ *   period exists alongside a fresh one (retention window > interval). By first aggregating to
+ *   MAX(to) per property and then taking MIN, we measure true workspace freshness without being
+ *   skewed by older rows that are still within retention. Restricting to the current version
+ *   further prevents stale versions from affecting due calculations.
+ */
 export async function findDueWorkspaceMinTos({
   now,
   interval = config().computePropertiesInterval,
@@ -447,9 +578,6 @@ export async function findDueWorkspaceMinTos({
 }: FindDueWorkspacesParams): Promise<
   { min: Date | null; workspaceId: string }[]
 > {
-  const w = aliasedTable(schema.workspace, "w");
-  const cpp = aliasedTable(schema.computedPropertyPeriod, "cpp");
-  const aggregatedMin = min(cpp.to);
   logger().info(
     {
       interval,
@@ -459,101 +587,15 @@ export async function findDueWorkspaceMinTos({
     "computePropertiesScheduler finding due workspaces",
   );
 
-  const secondsInterval = `${Math.floor(interval / 1000).toString()} seconds`;
-  const timestampNow = Math.floor(now / 1000);
-  const whereConditions: (SQL | undefined)[] = [
-    eq(w.status, WorkspaceStatusDbEnum.Active),
-    not(eq(w.type, WorkspaceTypeAppEnum.Parent)),
-    or(
-      inArray(
-        w.id,
-        db()
-          .select({ id: dbSegment.workspaceId })
-          .from(dbSegment)
-          .where(eq(dbSegment.status, "Running")),
-      ),
-      inArray(
-        w.id,
-        db()
-          .select({ id: dbUserProperty.workspaceId })
-          .from(dbUserProperty)
-          .where(eq(dbUserProperty.status, "Running")),
-      ),
-    ),
-  ];
+  const query = buildFindDueWorkspaceMinTosQuery({ now, interval, limit });
+  const periodsRaw = await query;
 
-  /**
-   * Explanation:
-   * - We select from `workspace w` (with an INNER JOIN on `feature` to ensure
-   *   only those with `ComputePropertiesGlobal` enabled).
-   * - We LEFT JOIN `computedPropertyPeriod` to pull the last period if it exists,
-   *   but still keep the workspace even if no records exist (`NULL` aggregatedMax).
-   * - We filter on w.status, w.type, feature.name, and feature.enabled, as before.
-   * - In the HAVING clause, we check:
-   *    (a) aggregatedMin IS NULL  => no computations ever run (cold start)
-   *    (b) aggregatedMin is older than `interval`.
-   * - Then we order by aggregatedMin ASC (nulls first) so that brand-new
-   *   (never computed) workspaces appear first, then oldest computations after.
-   */
-  const periodsQuery = await db()
-    .select({
-      workspaceId: w.id,
-      min: aggregatedMin,
-    })
-    .from(w)
-    .leftJoin(
-      cpp,
-      and(
-        eq(cpp.workspaceId, w.id),
-        eq(cpp.step, ComputedPropertyStepEnum.ComputeAssignments),
-        or(
-          and(
-            eq(cpp.type, "Segment"),
-            inArray(
-              cpp.computedPropertyId,
-              db()
-                .select({ id: dbSegment.id })
-                .from(dbSegment)
-                .where(
-                  and(
-                    eq(dbSegment.status, "Running"),
-                    eq(dbSegment.workspaceId, w.id),
-                  ),
-                ),
-            ),
-          ),
-          and(
-            eq(cpp.type, "UserProperty"),
-            inArray(
-              cpp.computedPropertyId,
-              db()
-                .select({ id: dbUserProperty.id })
-                .from(dbUserProperty)
-                .where(
-                  and(
-                    eq(dbUserProperty.status, "Running"),
-                    eq(dbUserProperty.workspaceId, w.id),
-                  ),
-                ),
-            ),
-          ),
-        ),
-      ),
-    )
-    .where(and(...whereConditions))
-    .groupBy(w.id)
-    .having(
-      or(
-        // Cold start: aggregatedMax is null => no existing compute records
-        sql`${aggregatedMin} IS NULL`,
-        // Overdue: last computation older than our interval
-        sql`(to_timestamp(${timestampNow}) - ${aggregatedMin}) > ${secondsInterval}::interval`,
-      ),
-    )
-    .orderBy(sql`${aggregatedMin} ASC NULLS FIRST`)
-    .limit(limit);
+  const periods = periodsRaw.map((row) => ({
+    workspaceId: row.workspaceId,
+    min: row.min ? new Date(`${row.min}+0000`) : null,
+  }));
 
-  return periodsQuery;
+  return periods;
 }
 
 export async function getComputedPropertyPeriods({

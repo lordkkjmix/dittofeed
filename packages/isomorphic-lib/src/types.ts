@@ -3739,9 +3739,27 @@ export const SignalWireSmsProvider = Type.Object({
 
 export type SignalWireSmsProvider = Static<typeof SignalWireSmsProvider>;
 
+export const BrevoSmsProvider = Type.Object({
+  id: Type.String(),
+  workspaceId: Type.String(),
+  type: Type.Optional(Type.Literal(SmsProviderType.Brevo)),
+});
+
+export type BrevoSmsProvider = Static<typeof BrevoSmsProvider>;
+
+export const WhatsAppCloudSmsProvider = Type.Object({
+  id: Type.String(),
+  workspaceId: Type.String(),
+  type: Type.Optional(Type.Literal(SmsProviderType.WhatsAppCloud)),
+});
+
+export type WhatsAppCloudSmsProvider = Static<typeof WhatsAppCloudSmsProvider>;
+
 export const PersistedSmsProvider = Type.Union([
   TwilioSmsProvider,
   SignalWireSmsProvider,
+  BrevoSmsProvider,
+  WhatsAppCloudSmsProvider,
   TestSmsProvider,
 ]);
 

@@ -106,6 +106,12 @@ export async function getOrCreateSmsProviders({
       case SmsProviderType.SignalWire:
         type = SmsProviderType.SignalWire;
         break;
+      case SmsProviderType.Brevo:
+        type = SmsProviderType.Brevo;
+        break;
+      case SmsProviderType.WhatsAppCloud:
+        type = SmsProviderType.WhatsAppCloud;
+        break;
       default:
         logger().error(
           {

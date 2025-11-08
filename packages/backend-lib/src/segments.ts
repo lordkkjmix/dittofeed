@@ -48,6 +48,7 @@ import {
   SegmentOperatorType,
   SegmentStatus,
   SegmentStatusEnum,
+  UpdateSegmentStatusRequest,
   UpsertSegmentResource,
   UpsertSegmentValidationError,
   UpsertSegmentValidationErrorType,
@@ -1069,15 +1070,72 @@ export async function getSegmentAssignmentDb({
   return rows[0]?.latest_segment_value ?? null;
 }
 
+export async function updateSegmentStatus({
+  workspaceId,
+  id,
+  status,
+}: UpdateSegmentStatusRequest): Promise<
+  Result<SavedSegmentResource | null, Error>
+> {
+  return db().transaction(async (tx) => {
+    // Fetch the segment to check if it's manual
+    const segment = await tx.query.segment.findFirst({
+      where: and(eq(dbSegment.workspaceId, workspaceId), eq(dbSegment.id, id)),
+    });
+
+    if (!segment) {
+      return ok(null);
+    }
+
+    // Check if the segment definition is valid and if it's a manual segment
+    const definitionResult = schemaValidateWithErr(
+      segment.definition,
+      SegmentDefinition,
+    );
+    if (definitionResult.isErr()) {
+      logger().error(
+        { err: definitionResult.error, workspaceId, id },
+        "failed to validate segment definition when updating status",
+      );
+      throw definitionResult.error;
+    }
+
+    const isManual =
+      definitionResult.value.entryNode.type === SegmentNodeType.Manual;
+    if (isManual) {
+      return err(new Error("Cannot change status of a manual segment"));
+    }
+
+    const [updated] = await tx
+      .update(dbSegment)
+      .set({ status })
+      .where(and(eq(dbSegment.workspaceId, workspaceId), eq(dbSegment.id, id)))
+      .returning();
+
+    if (!updated) {
+      return err(new Error("Failed to update segment status"));
+    }
+
+    const result = toSegmentResource(updated);
+    if (result.isErr()) {
+      logger().error(
+        { err: result.error, workspaceId, id },
+        "failed to convert segment to resource after status update",
+      );
+      return err(result.error);
+    }
+
+    return ok(result.value);
+  });
+}
+
 export async function deleteSegment({
   workspaceId,
   id,
 }: DeleteSegmentRequest): Promise<Segment | null> {
   const [deleted] = await db()
     .delete(dbSegment)
-    .where(
-      and(eq(dbSegment.id, id), eq(dbSegment.workspaceId, workspaceId)),
-    )
+    .where(and(eq(dbSegment.id, id), eq(dbSegment.workspaceId, workspaceId)))
     .returning();
 
   if (!deleted) {

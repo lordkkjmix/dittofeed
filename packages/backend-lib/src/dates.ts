@@ -29,16 +29,29 @@ function getTimezone({ latLon }: { latLon: string }): string {
 
 export function findNextLocalizedTimeInner({
   latLon,
+  userTimezone,
+  defaultTimezone,
   now,
   hour,
   minute = 0,
   allowedDaysOfWeek,
 }: LocalTimeDelayVariantFields & {
   latLon?: string;
+  userTimezone?: string;
   now: number;
 }): number {
-  const timezone =
-    typeof latLon === "string" ? getTimezone({ latLon }) : DEFAULT_TIMEZONE;
+  // Priority: user property timezone > latLon-derived timezone > defaultTimezone > UTC
+  let timezone: string;
+  if (userTimezone) {
+    timezone = userTimezone;
+  } else if (typeof latLon === "string") {
+    timezone = getTimezone({ latLon });
+  } else if (defaultTimezone) {
+    timezone = defaultTimezone;
+  } else {
+    timezone = DEFAULT_TIMEZONE;
+  }
+
   const offset = getTimezoneOffset(timezone, now);
   const zoned = offset + now;
 
@@ -63,6 +76,11 @@ export function findNextLocalizedTimeInner({
   throw new Error("Could not find next localized time");
 }
 
+/**
+ * @deprecated Use findNextLocalizedTimeV2 instead. This function hardcodes hour to 5
+ * and doesn't support custom minutes or allowedDaysOfWeek parameters.
+ * Kept for backwards compatibility with existing temporal workflows.
+ */
 export async function findNextLocalizedTime({
   workspaceId,
   userId,
@@ -81,6 +99,35 @@ export async function findNextLocalizedTime({
     latLon: typeof latLon === "string" ? latLon : undefined,
     now,
     hour: 5,
+  });
+}
+
+export async function findNextLocalizedTimeV2({
+  workspaceId,
+  userId,
+  now,
+  hour,
+  minute,
+  allowedDaysOfWeek,
+  defaultTimezone,
+}: {
+  workspaceId: string;
+  userId: string;
+  now: number;
+} & LocalTimeDelayVariantFields): Promise<number> {
+  const { latLon, timezone } = await findAllUserPropertyAssignments({
+    workspaceId,
+    userId,
+    userProperties: ["latLon", "timezone"],
+  });
+  return findNextLocalizedTimeInner({
+    latLon: typeof latLon === "string" ? latLon : undefined,
+    userTimezone: typeof timezone === "string" ? timezone : undefined,
+    defaultTimezone,
+    now,
+    hour,
+    minute,
+    allowedDaysOfWeek,
   });
 }
 

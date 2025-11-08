@@ -82,12 +82,21 @@ const {
   onNodeProcessedV2,
   isRunnable,
   findNextLocalizedTime,
+  findNextLocalizedTimeV2,
   getEarliestComputePropertyPeriod,
   getUserPropertyDelay,
   getWorkspace,
   shouldReEnter,
 } = proxyActivities<typeof activities>({
   startToCloseTimeout: "2 minutes",
+});
+
+const { waitForComputeProperties } = proxyActivities<typeof activities>({
+  startToCloseTimeout: "20 minutes",
+  heartbeatTimeout: "30 seconds",
+  retry: {
+    maximumAttempts: 3,
+  },
 });
 
 const { getEventsById, getSegmentAssignment } = wf.proxyLocalActivities<
@@ -639,12 +648,27 @@ export async function userJourneyWorkflow(
           }
           case DelayVariantType.LocalTime: {
             const now = Date.now();
-            const nexTime = await findNextLocalizedTime({
-              workspaceId,
-              userId,
-              now,
-            });
-            delay = nexTime - now;
+            let nextTime: number;
+            // Use patch for backwards compatibility with existing workflows
+            if (wf.patched("local-delay-improvements")) {
+              nextTime = await findNextLocalizedTimeV2({
+                workspaceId,
+                userId,
+                now,
+                hour: currentNode.variant.hour,
+                minute: currentNode.variant.minute,
+                allowedDaysOfWeek: currentNode.variant.allowedDaysOfWeek,
+                defaultTimezone: currentNode.variant.defaultTimezone,
+              });
+            } else {
+              // Legacy behavior: hardcoded to 5 AM
+              nextTime = await findNextLocalizedTime({
+                workspaceId,
+                userId,
+                now,
+              });
+            }
+            delay = nextTime - now;
             break;
           }
           case DelayVariantType.UserProperty: {
@@ -924,27 +948,41 @@ export async function userJourneyWorkflow(
         }
 
         if (currentNode.syncProperties) {
-          const now = Date.now();
+          const after = Date.now();
+          let succeeded: boolean;
 
-          // retry until compute properties workflow as run after message was sent
-          const succeeded = await retryExponential({
-            sleep,
-            check: async () => {
-              const period = await getEarliestComputePropertyPeriod({
-                workspaceId,
-              });
-              logger.debug("retrying until compute properties are updated", {
-                period,
-                now,
-                workspaceId,
-                userId,
-              });
-              return period > now;
-            },
-            logger,
-            baseDelay: 10000,
-            maxAttempts: 5,
-          });
+          if (wf.patched("wait-for-compute-properties-activity")) {
+            succeeded = await waitForComputeProperties({
+              workspaceId,
+              after,
+            });
+          } else {
+            succeeded = await retryExponential({
+              sleep,
+              check: async () => {
+                if (wf.patched("wait-for-compute-properties-activity")) {
+                  logger.error(
+                    "using deprecated in workflow retry method for syncProperties",
+                    defaultLoggingFields,
+                  );
+                  return true;
+                }
+                const period = await getEarliestComputePropertyPeriod({
+                  workspaceId,
+                });
+                logger.debug("retrying until compute properties are updated", {
+                  period,
+                  after,
+                  workspaceId,
+                  userId,
+                });
+                return period > after;
+              },
+              logger,
+              baseDelay: 10000,
+              maxAttempts: 5,
+            });
+          }
 
           if (!succeeded) {
             logger.error(

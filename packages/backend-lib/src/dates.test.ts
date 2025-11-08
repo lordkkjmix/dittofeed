@@ -2,7 +2,11 @@ import { randomUUID } from "crypto";
 import { differenceInHours } from "date-fns";
 import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 
-import { findNextLocalizedTimeInner, getUserPropertyDelay } from "./dates";
+import {
+  findNextLocalizedTimeInner,
+  findNextLocalizedTimeV2,
+  getUserPropertyDelay,
+} from "./dates";
 import { insert } from "./db";
 import { userProperty as dbUserProperty } from "./db/schema";
 import { UserPropertyDefinition, UserPropertyDefinitionType } from "./types";
@@ -65,6 +69,465 @@ describe("findNextLocalizedTimeInner", () => {
     });
     expect(result).toBeGreaterThan(now);
     expect(differenceInHours(result, now)).toBe(20);
+  });
+
+  describe("when using defaultTimezone parameter", () => {
+    it("uses defaultTimezone when no latLon or userTimezone is provided", () => {
+      // Tuesday 2023-12-19, 11 PM UTC
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      const result = findNextLocalizedTimeInner({
+        now,
+        hour: 8,
+        defaultTimezone: "America/New_York",
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // At 11 PM UTC, it's 6 PM in New York (EST)
+      // Next 8 AM in New York is ~14 hours away
+      expect(differenceInHours(result, now)).toBe(13);
+    });
+
+    it("prioritizes userTimezone over defaultTimezone", () => {
+      // Tuesday 2023-12-19, 11 PM UTC
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      const result = findNextLocalizedTimeInner({
+        now,
+        hour: 8,
+        userTimezone: "Asia/Tokyo",
+        defaultTimezone: "America/New_York",
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // At 11 PM UTC, it's 8 AM in Tokyo, so next 8 AM is 23 hours away
+      expect(differenceInHours(result, now)).toBe(23);
+    });
+
+    it("prioritizes userTimezone over latLon", () => {
+      // Tuesday 2023-12-19, 11 PM UTC
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      const result = findNextLocalizedTimeInner({
+        latLon: "33.8121,-117.9190", // Los Angeles
+        userTimezone: "Asia/Tokyo",
+        now,
+        hour: 8,
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // Should use Tokyo time, not LA time
+      expect(differenceInHours(result, now)).toBe(23);
+    });
+
+    it("prioritizes latLon over defaultTimezone", () => {
+      // Tuesday 2023-12-19, 11 PM UTC
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      const result = findNextLocalizedTimeInner({
+        latLon: "33.8121,-117.9190", // Los Angeles
+        defaultTimezone: "America/New_York",
+        now,
+        hour: 8,
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // At 11 PM UTC, it's 3 PM in LA, so next 8 AM is ~17 hours away
+      // Should use LA time (from latLon), not New York time (defaultTimezone)
+      expect(differenceInHours(result, now)).toBe(16);
+    });
+
+    it("falls back to UTC when no timezone parameters are provided", () => {
+      // Tuesday 2023-12-19, 11 PM UTC
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      const result = findNextLocalizedTimeInner({
+        now,
+        hour: 8,
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // At 11 PM UTC, next 8 AM UTC is ~9 hours away
+      expect(differenceInHours(result, now)).toBe(8);
+    });
+  });
+});
+
+describe("findNextLocalizedTimeV2", () => {
+  let userId: string;
+  let workspaceId: string;
+  let latLonPropertyId: string;
+
+  beforeEach(async () => {
+    userId = randomUUID();
+    const workspace = unwrap(
+      await createWorkspace({
+        id: randomUUID(),
+        name: `test-workspace-${randomUUID()}`,
+        updatedAt: new Date(),
+      }),
+    );
+    workspaceId = workspace.id;
+
+    // Create latLon user property
+    const latLonProperty = unwrap(
+      await insert({
+        table: dbUserProperty,
+        values: {
+          id: randomUUID(),
+          name: "latLon",
+          definition: {
+            type: UserPropertyDefinitionType.Performed,
+            path: "latLon",
+            event: "*",
+          } satisfies UserPropertyDefinition,
+          workspaceId: workspace.id,
+          updatedAt: new Date(),
+        },
+      }),
+    );
+    latLonPropertyId = latLonProperty.id;
+  });
+
+  describe("with custom hour parameter", () => {
+    it("should schedule for the specified hour, not hardcoded 5 AM", async () => {
+      // Tuesday 2023-12-19, slightly after 4 PM in Los Angeles time
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      await insertUserPropertyAssignments([
+        {
+          workspaceId,
+          userId,
+          userPropertyId: latLonPropertyId,
+          value: "33.8121,-117.9190", // Disneyland, Los Angeles
+        },
+      ]);
+
+      // Schedule for 8 PM (hour: 20) local time
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 20,
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // Should be ~4 hours until 8 PM local time, not ~30 hours until 5 AM next day
+      expect(differenceInHours(result, now)).toBe(4);
+    });
+
+    it("should work with different hour values", async () => {
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      await insertUserPropertyAssignments([
+        {
+          workspaceId,
+          userId,
+          userPropertyId: latLonPropertyId,
+          value: "35.6764,139.6500", // Tokyo
+        },
+      ]);
+
+      // Schedule for 10 AM Tokyo time
+      // Current time is ~8 AM Tokyo time, so 10 AM is ~2 hours away
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 10,
+      });
+
+      expect(result).toBeGreaterThan(now);
+      expect(differenceInHours(result, now)).toBe(1);
+    });
+  });
+
+  describe("with custom minute parameter", () => {
+    it("should schedule for the specified minute when provided", async () => {
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      await insertUserPropertyAssignments([
+        {
+          workspaceId,
+          userId,
+          userPropertyId: latLonPropertyId,
+          value: "33.8121,-117.9190",
+        },
+      ]);
+
+      // Schedule for 8:30 PM local time
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 20,
+        minute: 30,
+      });
+
+      const resultDate = new Date(result);
+      expect(result).toBeGreaterThan(now);
+      // Verify it's scheduled for XX:30, not XX:00
+      expect(resultDate.getUTCMinutes()).toBe(30);
+    });
+
+    it("should default to minute 0 when not specified", async () => {
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      await insertUserPropertyAssignments([
+        {
+          workspaceId,
+          userId,
+          userPropertyId: latLonPropertyId,
+          value: "33.8121,-117.9190",
+        },
+      ]);
+
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 20,
+      });
+
+      const resultDate = new Date(result);
+      expect(resultDate.getUTCMinutes()).toBe(0);
+    });
+  });
+
+  describe("with allowedDaysOfWeek parameter", () => {
+    it("should respect allowedDaysOfWeek when provided", async () => {
+      // Tuesday, 2023-12-19, slightly after 8 AM Tokyo time
+      const now = new Date("2023-12-19T23:00:12.12Z").getTime();
+
+      await insertUserPropertyAssignments([
+        {
+          workspaceId,
+          userId,
+          userPropertyId: latLonPropertyId,
+          value: "35.6764,139.6500", // Tokyo
+        },
+      ]);
+
+      // Schedule for Thursday (day 4) at 5 AM
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 5,
+        allowedDaysOfWeek: [4],
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // Should be 44 hours until Thursday at 5 AM, not 20 hours until next day at 5 AM
+      expect(differenceInHours(result, now)).toBe(44);
+    });
+
+    it("should allow any day when allowedDaysOfWeek is not specified", async () => {
+      const now = new Date("2023-12-19T23:00:12.12Z").getTime();
+
+      await insertUserPropertyAssignments([
+        {
+          workspaceId,
+          userId,
+          userPropertyId: latLonPropertyId,
+          value: "35.6764,139.6500",
+        },
+      ]);
+
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 5,
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // Should schedule for next occurrence (20 hours), not wait for specific day
+      expect(differenceInHours(result, now)).toBe(20);
+    });
+  });
+
+  describe("with defaultTimezone parameter", () => {
+    let timezonePropertyId: string;
+
+    beforeEach(async () => {
+      // Create timezone user property
+      const timezoneProperty = unwrap(
+        await insert({
+          table: dbUserProperty,
+          values: {
+            id: randomUUID(),
+            name: "timezone",
+            definition: {
+              type: UserPropertyDefinitionType.Performed,
+              path: "timezone",
+              event: "*",
+            } satisfies UserPropertyDefinition,
+            workspaceId,
+            updatedAt: new Date(),
+          },
+        }),
+      );
+      timezonePropertyId = timezoneProperty.id;
+    });
+
+    it("should use defaultTimezone when no user property timezone is set", async () => {
+      // Tuesday 2023-12-19, 11 PM UTC
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      // Don't set any user properties - no latLon, no timezone
+      // Schedule for 8 AM in America/New_York (UTC-5)
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 8,
+        defaultTimezone: "America/New_York",
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // At 11 PM UTC, it's 6 PM in New York (EST)
+      // Next 8 AM in New York is ~14 hours away (13-14 due to rounding)
+      expect(differenceInHours(result, now)).toBe(13);
+    });
+
+    it("should prioritize user property timezone over defaultTimezone", async () => {
+      // Tuesday 2023-12-19, 11 PM UTC
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      // Set user's timezone to Tokyo
+      await insertUserPropertyAssignments([
+        {
+          workspaceId,
+          userId,
+          userPropertyId: timezonePropertyId,
+          value: "Asia/Tokyo",
+        },
+      ]);
+
+      // Schedule for 8 AM, defaultTimezone is New York but user is in Tokyo
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 8,
+        defaultTimezone: "America/New_York", // This should be ignored
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // At 11 PM UTC, it's 8 AM in Tokyo, so next 8 AM is 23 hours away
+      expect(differenceInHours(result, now)).toBe(23);
+    });
+
+    it("should prioritize user property timezone over latLon", async () => {
+      // Tuesday 2023-12-19, 11 PM UTC
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      // Set both latLon (Los Angeles) and timezone (Tokyo)
+      await insertUserPropertyAssignments([
+        {
+          workspaceId,
+          userId,
+          userPropertyId: latLonPropertyId,
+          value: "33.8121,-117.9190", // Los Angeles
+        },
+        {
+          workspaceId,
+          userId,
+          userPropertyId: timezonePropertyId,
+          value: "Asia/Tokyo",
+        },
+      ]);
+
+      // Schedule for 8 AM - should use Tokyo time, not LA time
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 8,
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // Should be 23 hours (Tokyo time), not 9 hours (LA time)
+      expect(differenceInHours(result, now)).toBe(23);
+    });
+
+    it("should respect user's assigned timezone property", async () => {
+      // Wednesday 2023-12-20, 3 AM UTC
+      const now = new Date("2023-12-20T03:00:00.000Z").getTime();
+
+      // Assign user to Europe/London timezone (UTC+0 in winter)
+      await insertUserPropertyAssignments([
+        {
+          workspaceId,
+          userId,
+          userPropertyId: timezonePropertyId,
+          value: "Europe/London",
+        },
+      ]);
+
+      // Schedule for 10 AM in user's timezone
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 10,
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // At 3 AM UTC = 3 AM in London, next 10 AM is 7 hours away
+      expect(differenceInHours(result, now)).toBe(7);
+
+      // Verify the actual scheduled time
+      const resultDate = new Date(result);
+      expect(resultDate.toISOString()).toBe("2023-12-20T10:00:00.000Z");
+    });
+
+    it("should use latLon when no timezone property but latLon is set", async () => {
+      // Tuesday 2023-12-19, 11 PM UTC
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      // Set only latLon, no timezone property
+      await insertUserPropertyAssignments([
+        {
+          workspaceId,
+          userId,
+          userPropertyId: latLonPropertyId,
+          value: "33.8121,-117.9190", // Los Angeles
+        },
+      ]);
+
+      // Schedule for 8 AM with a defaultTimezone
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 8,
+        defaultTimezone: "America/New_York", // This should be ignored in favor of latLon
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // At 11 PM UTC, it's 3 PM in LA (PST), so next 8 AM is ~17 hours away
+      // Should use LA time (from latLon), not New York time (defaultTimezone)
+      expect(differenceInHours(result, now)).toBe(16);
+    });
+
+    it("should fall back to UTC when no timezone sources are available", async () => {
+      // Tuesday 2023-12-19, 11 PM UTC
+      const now = new Date("2023-12-19T23:00:12.123Z").getTime();
+
+      // Don't set any user properties or defaultTimezone
+      const result = await findNextLocalizedTimeV2({
+        workspaceId,
+        userId,
+        now,
+        hour: 8,
+      });
+
+      expect(result).toBeGreaterThan(now);
+      // At 11 PM UTC, next 8 AM UTC is ~9 hours away (8-9 due to rounding)
+      expect(differenceInHours(result, now)).toBe(8);
+    });
   });
 });
 

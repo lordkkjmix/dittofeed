@@ -39,6 +39,9 @@ services:
       DATABASE_PASSWORD: ${DATABASE_PASSWORD:-password}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      DATABASE_HOST: ${DATABASE_HOST:-postgres}
+      DATABASE_PORT: ${DATABASE_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-dittofeed}
     # README: To add local env variables uncomment the following line and add a .env file in the root directory
     # env_file:
     #   - .env

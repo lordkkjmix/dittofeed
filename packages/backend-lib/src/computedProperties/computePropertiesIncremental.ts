@@ -136,15 +136,6 @@ function shouldResetComputedProperty({
   now: number;
   periodBound?: number;
 }): boolean {
-  // logger().debug(
-  //   {
-  //     notDefinitionUpdatedAt: !definitionUpdatedAt,
-  //     definitionUpdatedInPeriod: definitionUpdatedAt <= now,
-  //     definitionUpdatedAfterCreated: definitionUpdatedAt > createdAt,
-  //     definitionUpdatedAt >= (periodBound ?? 0)
-  //   },
-  //   "loc2",
-  // );
   if (!definitionUpdatedAt) {
     return false;
   }
@@ -345,6 +336,32 @@ interface FullSubQueryData {
 }
 type SubQueryData = Omit<FullSubQueryData, "version">;
 
+function getSegmentNodeVersion(
+  segment: SavedSegmentResource,
+  nodeId: string,
+): number | null {
+  const { definition } = segment;
+  if (!definition) {
+    return null;
+  }
+  const nodes: SegmentNode[] = [
+    definition.entryNode,
+    ...(definition.nodes ?? []),
+  ];
+  const node = nodes.find((n) => n.id === nodeId);
+  if (!node) {
+    return null;
+  }
+  if (
+    node.type === SegmentNodeType.Trait &&
+    node.operator?.type === SegmentOperatorType.NotExists
+  ) {
+    // Version 1 for Trait + NotExists semantics fix
+    return 1;
+  }
+  return null;
+}
+
 export function segmentNodeStateId(
   segment: SavedSegmentResource,
   nodeId: string,
@@ -358,10 +375,10 @@ export function segmentNodeStateId(
     );
     return null;
   }
-  return uuidv5(
-    `${segment.definitionUpdatedAt.toString()}:${nodeId}`,
-    segment.id,
-  );
+  const nodeVersion = getSegmentNodeVersion(segment, nodeId);
+  const versionSuffix = nodeVersion !== null ? `:v${nodeVersion}` : "";
+  const name = `${segment.definitionUpdatedAt.toString()}:${nodeId}${versionSuffix}`;
+  return uuidv5(name, segment.id);
 }
 
 function segmentToIndexed({
@@ -1230,13 +1247,17 @@ function segmentToResolvedState({
             buildRecentUpdateSegmentQuery({
               workspaceId,
               stateId,
-              // We use the stateId as a placeholder string to allow NotExists to
-              // select empty values. No real danger of collisions given that
-              // stateId is a uuid.
-              expression: `argMaxMerge(last_value) == ${qb.addQueryValue(
+              // NotExists should be true if the trait has never had a
+              // non-empty value. We encode empties vs non-empties in
+              // uniqValue and then detect the "only empties" case via the
+              // combination of uniqMerge(unique_count) and argMaxMerge(last_value).
+              //
+              // uniqMerge(unique_count) == 1 and last_value == stateId
+              // => we have only seen empty/missing values for this trait.
+              expression: `(uniqMerge(unique_count) == 1 and argMaxMerge(last_value) == ${qb.addQueryValue(
                 stateId,
                 "String",
-              )}`,
+              )})`,
               segmentId: segment.id,
               now,
               periodBound,
@@ -1715,17 +1736,45 @@ export function segmentNodeToStateSubQuery({
       if (!path) {
         return [];
       }
-      if (
-        node.operator.type === SegmentOperatorType.NotEquals ||
-        node.operator.type === SegmentOperatorType.NotExists
-      ) {
+      if (node.operator.type === SegmentOperatorType.NotEquals) {
         const varName = qb.getVariableName();
         return [
           {
             condition: `event_type == 'identify'`,
             type: "segment",
             uniqValue: "''",
-            // using stateId as placeholder string to allow NotEquals and NotExists
+            // using stateId as placeholder string to allow NotEquals
+            // to select empty values. no real danger of collissions given that
+            // stateId is a uuid
+            argMaxValue: `
+              if(
+                (JSON_VALUE(properties, ${path}) as ${varName}) == '',
+                ${qb.addQueryValue(stateId, "String")},
+                ${varName}
+              )
+            `,
+            computedPropertyId: segment.id,
+            stateId,
+          },
+        ];
+      }
+      if (node.operator.type === SegmentOperatorType.NotExists) {
+        const varName = qb.getVariableName();
+        return [
+          {
+            condition: `event_type == 'identify'`,
+            type: "segment",
+            // mark empties vs non-empties so we can later distinguish
+            // "only empties" from "has at least one non-empty" using
+            // uniqMerge(unique_count) together with argMaxMerge(last_value)
+            uniqValue: `
+              if(
+                JSON_VALUE(properties, ${path}) == '',
+                'E',
+                'N'
+              )
+            `,
+            // using stateId as placeholder string to allow NotExists
             // to select empty values. no real danger of collissions given that
             // stateId is a uuid
             argMaxValue: `
@@ -3071,47 +3120,75 @@ export async function computeState({
   });
 }
 
+interface AssignmentQuery {
+  query: string;
+  computedPropertyId: string;
+  computedPropertyType: "segment" | "user_property";
+}
+
 interface AssignmentQueryGroup {
-  queries: (string | string[])[];
+  queries: (AssignmentQuery | AssignmentQuery[])[];
   qb: ClickHouseQueryBuilder;
 }
 
-async function execAssignmentQueryGroup(
-  group: AssignmentQueryGroup,
-  clickhouseClient: ReturnType<typeof createClickhouseClient>,
-) {
+async function execAssignmentQueryGroup({
+  workspaceId,
+  group,
+  clickhouseClient,
+}: {
+  workspaceId: string;
+  group: AssignmentQueryGroup;
+  clickhouseClient: ReturnType<typeof createClickhouseClient>;
+}) {
   const { queries, qb } = group;
-  for (const query of queries) {
-    if (Array.isArray(query)) {
+  for (const assignmentQuery of queries) {
+    if (Array.isArray(assignmentQuery)) {
       await Promise.all(
-        query.map((q) =>
-          command(
-            {
-              query: q,
-              query_params: qb.getQueries(),
-              clickhouse_settings: {
-                wait_end_of_query: 1,
-                max_execution_time:
-                  config().clickhouseComputePropertiesMaxExecutionTime,
-              },
-            },
-            { clickhouseClient },
-          ),
+        assignmentQuery.map(
+          ({ query, computedPropertyId, computedPropertyType }) =>
+            withSpan({ name: "exec-assignment-query" }, async (span) => {
+              span.setAttribute("workspaceId", workspaceId);
+              span.setAttribute("computedPropertyId", computedPropertyId);
+              span.setAttribute("computedPropertyType", computedPropertyType);
+              return command(
+                {
+                  query,
+                  query_params: qb.getQueries(),
+                  clickhouse_settings: {
+                    wait_end_of_query: 1,
+                    max_execution_time:
+                      config().clickhouseComputePropertiesMaxExecutionTime,
+                  },
+                },
+                { clickhouseClient },
+              );
+            }),
         ),
       );
     } else {
-      await command(
-        {
-          query,
-          query_params: qb.getQueries(),
-          clickhouse_settings: {
-            wait_end_of_query: 1,
-            max_execution_time:
-              config().clickhouseComputePropertiesMaxExecutionTime,
+      await withSpan({ name: "exec-assignment-query" }, async (span) => {
+        span.setAttribute("workspaceId", workspaceId);
+        span.setAttribute(
+          "computedPropertyId",
+          assignmentQuery.computedPropertyId,
+        );
+        span.setAttribute(
+          "computedPropertyType",
+          assignmentQuery.computedPropertyType,
+        );
+        return command(
+          {
+            query: assignmentQuery.query,
+            query_params: qb.getQueries(),
+            clickhouse_settings: {
+              wait_end_of_query: 1,
+              max_execution_time:
+                config().clickhouseComputePropertiesMaxExecutionTime,
+            },
           },
-        },
-        { clickhouseClient },
-      );
+          { clickhouseClient },
+        );
+      });
     }
   }
 }
@@ -3279,8 +3356,8 @@ export async function computeAssignments({
           }
         }
 
-        const queries: (string | string[])[] = [
-          resolvedQueries,
+        const queries: (string | string)[] = [
+          ...resolvedQueries,
           ...assignmentQueries,
         ];
 
@@ -3327,7 +3404,11 @@ export async function computeAssignments({
         }
 
         segmentQueries.push({
-          queries,
+          queries: queries.map((query) => ({
+            query,
+            computedPropertyId: segment.id,
+            computedPropertyType: "segment" as const,
+          })),
           qb,
         });
       });
@@ -3413,7 +3494,11 @@ export async function computeAssignments({
           return;
         }
         userPropertyQueries.push({
-          queries,
+          queries: queries.map((query) => ({
+            query,
+            computedPropertyId: userProperty.id,
+            computedPropertyType: "user_property" as const,
+          })),
           qb,
         });
       });
@@ -3421,7 +3506,11 @@ export async function computeAssignments({
 
     await Promise.all(
       [...segmentQueries, ...userPropertyQueries].map((group) =>
-        execAssignmentQueryGroup(group, clickhouseClient),
+        execAssignmentQueryGroup({
+          workspaceId,
+          group,
+          clickhouseClient,
+        }),
       ),
     );
 

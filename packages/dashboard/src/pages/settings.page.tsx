@@ -671,7 +671,8 @@ function SegmentIoConfig() {
                     },
                   },
                   ...(isEnabled
-                    ? ([
+                    ? // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+                      ([
                         {
                           id: "shared-secret",
                           type: "text",
@@ -998,6 +999,23 @@ function PostMarkConfig() {
                     ),
                   },
                 },
+                {
+                  id: "postmark-message-stream",
+                  type: "secret",
+                  fieldProps: {
+                    name: SecretNames.Postmark,
+                    secretKey: "messageStream",
+                    label: "Message Stream",
+                    helperText:
+                      "Message stream to use for sending emails. Usually 'broadcast'.",
+                    type: EmailProviderType.PostMark,
+                    saved: isSecretSaved(
+                      SecretNames.Postmark,
+                      "messageStream",
+                      secretAvailability,
+                    ),
+                  },
+                },
               ],
             },
           ],
@@ -1302,6 +1320,7 @@ function DefaultSmsConfig() {
         name = "Test";
         break;
       default:
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
         assertUnreachable(type as never, `Unknown sms provider type ${type}`);
     }
     return {

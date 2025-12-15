@@ -109,8 +109,8 @@ services:
   clickhouse-server:
     image: clickhouse/clickhouse-server:${CLICKHOUSER_SERVER_IMAGE:-24.12.6.70-alpine}
     restart: always
-    logging:
-      driver: "local"
+    #logging:
+      #driver: "local"
     deploy:
       resources:
         limits:

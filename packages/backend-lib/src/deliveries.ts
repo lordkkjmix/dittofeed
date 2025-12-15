@@ -23,10 +23,10 @@ import {
   streamClickhouseQuery,
 } from "./clickhouse";
 import logger from "./logger";
+import { withSpan } from "./openTelemetry";
 import { deserializeCursor, serializeCursor } from "./pagination";
 import {
   ChannelType,
-  EmailEventList,
   GetDeliveryBodyRequest,
   InternalEventType,
   MessageSendSuccessContents,
@@ -72,20 +72,48 @@ function serializeCursorOffset(offset: number): string {
   });
 }
 
-export function buildDeliverySearchQuery(
-  params: SearchDeliveriesRequest,
-  qb: ClickHouseQueryBuilder,
-): {
-  query: string;
-  queryParams: Record<string, unknown>;
-} {
+interface DeliverySearchQueryBody {
+  messageSendsCte: {
+    head: string;
+    tail: string;
+  };
+  statusEventsCte: string;
+  triggeringEventsCte?: string;
+  fromClause: string;
+  hasContextOrTriggeringFilters: boolean;
+}
+
+interface AppendWhereClauseArgs {
+  baseClause: string;
+  condition?: string;
+}
+
+function appendWhereClause({
+  baseClause,
+  condition,
+}: AppendWhereClauseArgs): string {
+  if (!condition) {
+    return baseClause;
+  }
+  if (!baseClause) {
+    return ` WHERE ${condition}`;
+  }
+  return `${baseClause}
+    AND ${condition}`;
+}
+
+interface BuildDeliverySearchQueryBodyArgs {
+  params: SearchDeliveriesRequest;
+  qb: ClickHouseQueryBuilder;
+}
+
+export function buildDeliverySearchQueryBody({
+  params,
+  qb,
+}: BuildDeliverySearchQueryBodyArgs): DeliverySearchQueryBody {
   const {
     workspaceId,
-    cursor,
-    limit = 20,
     journeyId,
-    sortBy = SearchDeliveriesRequestSortByEnum.sentAt,
-    sortDirection = SortDirectionEnum.Desc,
     channels,
     userId,
     to,
@@ -100,7 +128,6 @@ export function buildDeliverySearchQuery(
     contextValues: contextValuesInput,
   } = params;
 
-  const offset = parseCursorOffset(cursor);
   const triggeringProperties = triggeringPropertiesInput
     ? triggeringPropertiesInput.map(({ key, value }) => ({ key, value }))
     : undefined;
@@ -110,7 +137,6 @@ export function buildDeliverySearchQuery(
 
   const workspaceIdParam = qb.addQueryValue(workspaceId, "String");
 
-  // Build message_sends CTE conditions
   const messageSendsConditions: string[] = [
     `workspace_id = ${workspaceIdParam}`,
     `event = '${InternalEventType.MessageSent}'`,
@@ -195,7 +221,6 @@ export function buildDeliverySearchQuery(
       )`);
   }
 
-  // Build status_events CTE conditions - exclude MessageSent as that's the initial event, not a status update
   const statusEventsList = StatusEventsList;
   const statusEventsConditions: string[] = [
     `workspace_id = ${workspaceIdParam}`,
@@ -206,7 +231,6 @@ export function buildDeliverySearchQuery(
     "statusEventsList",
   );
 
-  // Apply same filters as message_sends for consistency
   if (journeyId) {
     statusEventsConditions.push(
       `journey_id = ${qb.addQueryValue(journeyId, "String")}`,
@@ -235,8 +259,7 @@ export function buildDeliverySearchQuery(
   // Input semantics:
   // - items: array of {key, value} filters. Multiple entries with the same key are OR'ed together.
   // - Different keys are AND'ed together.
-  // - targetExpr: a vetted ClickHouse JSON expression string identifying the object to search, and must
-  //   be one of:
+  // - targetExpr: a vetted ClickHouse JSON expression identifying the object to search. Supported targets:
   //     - "triggering_events.properties" (joined table of the triggering event)
   //     - "JSONExtractString(uev.message_raw, 'context')" (context captured on the MessageSent event)
   //
@@ -266,13 +289,11 @@ export function buildDeliverySearchQuery(
         }
         const keyParam = qb.addQueryValue(key, "String");
 
-        // For a single key, build an OR over all values provided for that key
         const valueConditions = map(keyItems, ({ value }) => {
           if (typeof value === "string") {
             const stringParam = qb.addQueryValue(value, "String");
             const stringScalarCheck = `(JSONExtractString(${targetExpr}, ${keyParam}) = ${stringParam})`;
             const arrayStringCheck = `has(JSONExtract(${targetExpr}, ${keyParam}, 'Array(String)'), ${stringParam})`;
-            // Attempt numeric match via safe cast in ClickHouse
             const toInt = `toInt64OrNull(${stringParam})`;
             const numberScalarCheck = `(JSONExtractInt(${targetExpr}, ${keyParam}) = ${toInt})`;
             const arrayIntCheck = `has(JSONExtract(${targetExpr}, ${keyParam}, 'Array(Int64)'), ifNull(${toInt}, 0))`;
@@ -284,7 +305,6 @@ export function buildDeliverySearchQuery(
             const intParam = qb.addQueryValue(roundedValue, "Int64");
             const numberScalarCheck = `(JSONExtractInt(${targetExpr}, ${keyParam}) = ${intParam})`;
             const arrayIntCheck = `has(JSONExtract(${targetExpr}, ${keyParam}, 'Array(Int64)'), ${intParam})`;
-            // Also allow matching if the stored value is stringified
             const stringParam = qb.addQueryValue(
               String(roundedValue),
               "String",
@@ -323,7 +343,6 @@ export function buildDeliverySearchQuery(
     );
   }
 
-  // Process context values filtering
   let contextValuesClause = "";
   if (contextValues && contextValues.length > 0) {
     contextValuesClause = buildPropertyConditionsForTarget(
@@ -332,71 +351,41 @@ export function buildDeliverySearchQuery(
     );
   }
 
-  // Determine if we need context or triggering property filtering
-  const hasContextOrTriggeringFilters =
+  const hasContextOrTriggeringFilters = Boolean(
     (triggeringProperties &&
       triggeringProperties.length > 0 &&
       triggeringPropertiesClauseTrigger !== "1=0") ||
-    (contextValues &&
-      contextValues.length > 0 &&
-      contextValuesClause !== "1=0");
+      (contextValues &&
+        contextValues.length > 0 &&
+        contextValuesClause !== "1=0"),
+  );
 
-  // Determine whether to put LIMIT in inner query or outer query based on Phase 4 strategy
-  // Case A (99% of queries - no context/triggering filters): Keep LIMIT in inner query
-  // Case B (with context/triggering filters): Move LIMIT to outer query
-  const innerLimit = !hasContextOrTriggeringFilters
-    ? `LIMIT ${qb.addQueryValue(limit, "UInt64")} OFFSET ${qb.addQueryValue(offset, "UInt64")}`
-    : "";
-  const outerLimit = hasContextOrTriggeringFilters
-    ? `LIMIT ${qb.addQueryValue(limit, "UInt64")} OFFSET ${qb.addQueryValue(offset, "UInt64")}`
-    : "";
-
-  let sortByClause: string;
-  const direction = sortDirection === SortDirectionEnum.Desc ? "DESC" : "ASC";
-  switch (sortBy) {
-    case "sentAt": {
-      sortByClause = `sent_at ${direction}, origin_message_id ASC`;
-      break;
-    }
-    case "status": {
-      sortByClause = `last_event ${direction}, sent_at DESC, origin_message_id ASC`;
-      break;
-    }
-    case "from": {
-      sortByClause = `JSON_VALUE(properties, '$.variant.from') ${direction}, sent_at DESC, origin_message_id ASC`;
-      break;
-    }
-    case "to": {
-      sortByClause = `JSON_VALUE(properties, '$.variant.to') ${direction}, sent_at DESC, origin_message_id ASC`;
-      break;
-    }
-    default: {
-      assertUnreachable(sortBy);
-    }
-  }
-
-  // Build final WHERE clause for context/triggering filtering
   let finalWhereClause = "";
-  const hasValidTriggeringPropsTrigger =
+  const hasValidTriggeringPropsTrigger = Boolean(
     triggeringPropertiesClauseTrigger &&
-    triggeringPropertiesClauseTrigger !== "1=0";
-  const hasValidContextValues =
-    contextValuesClause && contextValuesClause !== "1=0";
+      triggeringPropertiesClauseTrigger !== "1=0",
+  );
+  const hasValidContextValues = Boolean(
+    contextValuesClause && contextValuesClause !== "1=0",
+  );
 
   if (hasValidTriggeringPropsTrigger && hasValidContextValues) {
-    // Both inputs present - OR logic for backwards compatibility
     finalWhereClause = ` WHERE ((triggering_events.properties IS NOT NULL AND (${triggeringPropertiesClauseTrigger})) OR (JSONExtractString(uev.message_raw, 'context') != '' AND (${contextValuesClause})))`;
   } else if (hasValidTriggeringPropsTrigger) {
-    // Only triggeringProperties provided
     finalWhereClause = ` WHERE triggering_events.properties IS NOT NULL AND (${triggeringPropertiesClauseTrigger})`;
   } else if (hasValidContextValues) {
-    // Only context values
     finalWhereClause = ` WHERE JSONExtractString(uev.message_raw, 'context') != '' AND (${contextValuesClause})`;
   }
 
-  // Build the optimized query using CTEs and the internal_events table
-  const query = `
-    WITH message_sends AS (
+  const statusesCondition = statuses
+    ? `if(se.origin_message_id != '', se.last_event, '${InternalEventType.MessageSent}') IN ${qb.addQueryValue(statuses, "Array(String)")}`
+    : "";
+  const whereClause = appendWhereClause({
+    baseClause: finalWhereClause,
+    condition: statusesCondition,
+  });
+
+  const messageSendsCteHead = `
       SELECT DISTINCT * FROM (
         SELECT
           workspace_id,
@@ -408,11 +397,11 @@ export function buildDeliverySearchQuery(
         FROM internal_events
         WHERE
           ${messageSendsConditions.join(" AND ")}
-        ORDER BY processing_time DESC
-        ${innerLimit}
-      )
-    ),
-    status_events AS (
+        ORDER BY processing_time DESC`;
+  const messageSendsCteTail = `
+      )`;
+
+  const statusEventsCte = `
       SELECT
         workspace_id,
         user_or_anonymous_id,
@@ -425,11 +414,10 @@ export function buildDeliverySearchQuery(
         AND origin_message_id IN (
           SELECT message_id FROM message_sends
         )
-      GROUP BY workspace_id, user_or_anonymous_id, origin_message_id
-    )${
-      hasValidTriggeringPropsTrigger
-        ? `,
-    triggering_events AS (
+      GROUP BY workspace_id, user_or_anonymous_id, origin_message_id`;
+
+  const triggeringEventsCte = hasValidTriggeringPropsTrigger
+    ? `
       SELECT
         message_id,
         properties
@@ -440,21 +428,10 @@ export function buildDeliverySearchQuery(
           SELECT DISTINCT triggering_message_id
           FROM message_sends
           WHERE triggering_message_id != ''
-        )
-    )`
-        : ""
-    }
-    SELECT
-      if(se.origin_message_id != '', se.last_event, '${InternalEventType.MessageSent}') as last_event,
-      uev.properties as properties,
-      JSONExtractString(uev.message_raw, 'context') as context,
-      if(se.origin_message_id != '', se.max_event_time, ms.event_time) as updated_at,
-      ms.event_time as sent_at,
-      ms.user_or_anonymous_id as user_or_anonymous_id,
-      ms.message_id as origin_message_id,
-      ms.triggering_message_id as triggering_message_id,
-      ms.workspace_id as workspace_id,
-      if(uev.anonymous_id != '', 1, 0) as is_anonymous
+        )`
+    : undefined;
+
+  let fromClause = `
     FROM message_sends ms
     LEFT JOIN status_events se ON
       ms.workspace_id = se.workspace_id
@@ -486,18 +463,183 @@ export function buildDeliverySearchQuery(
       AND ms.user_or_anonymous_id = uev.user_or_anonymous_id
       AND ms.processing_time = uev.processing_time
       AND ms.event_time = uev.event_time
-      AND ms.message_id = uev.message_id
-    ${hasValidTriggeringPropsTrigger ? `LEFT JOIN triggering_events ON ms.triggering_message_id = triggering_events.message_id` : ""}
-    ${finalWhereClause}
-    ${statuses ? `${finalWhereClause ? "AND" : "WHERE"} if(se.origin_message_id != '', se.last_event, '${InternalEventType.MessageSent}') IN ${qb.addQueryValue(statuses, "Array(String)")}` : ""}
-    ORDER BY ${sortByClause}
-    ${outerLimit}
+      AND ms.message_id = uev.message_id`;
+  if (hasValidTriggeringPropsTrigger) {
+    fromClause += `
+    LEFT JOIN triggering_events ON ms.triggering_message_id = triggering_events.message_id`;
+  }
+  if (whereClause) {
+    fromClause += `
+    ${whereClause.trimStart()}`;
+  }
+
+  return {
+    messageSendsCte: {
+      head: messageSendsCteHead,
+      tail: messageSendsCteTail,
+    },
+    statusEventsCte,
+    triggeringEventsCte,
+    fromClause,
+    hasContextOrTriggeringFilters,
+  };
+}
+
+interface BuildDeliverySearchQueryArgs {
+  params: SearchDeliveriesRequest;
+  qb: ClickHouseQueryBuilder;
+}
+
+export function buildDeliverySearchQuery({
+  params,
+  qb,
+}: BuildDeliverySearchQueryArgs): {
+  query: string;
+  queryParams: Record<string, unknown>;
+} {
+  const {
+    cursor,
+    limit = 20,
+    sortBy = SearchDeliveriesRequestSortByEnum.sentAt,
+    sortDirection = SortDirectionEnum.Desc,
+  } = params;
+
+  const offset = parseCursorOffset(cursor);
+  const queryBody = buildDeliverySearchQueryBody({
+    params,
+    qb,
+  });
+
+  const innerLimit = !queryBody.hasContextOrTriggeringFilters
+    ? `LIMIT ${qb.addQueryValue(limit, "UInt64")} OFFSET ${qb.addQueryValue(offset, "UInt64")}`
+    : "";
+  const outerLimit = queryBody.hasContextOrTriggeringFilters
+    ? `LIMIT ${qb.addQueryValue(limit, "UInt64")} OFFSET ${qb.addQueryValue(offset, "UInt64")}`
+    : "";
+
+  let sortByClause: string;
+  const direction = sortDirection === SortDirectionEnum.Desc ? "DESC" : "ASC";
+  switch (sortBy) {
+    case "sentAt": {
+      sortByClause = `sent_at ${direction}, origin_message_id ASC`;
+      break;
+    }
+    case "status": {
+      sortByClause = `last_event ${direction}, sent_at DESC, origin_message_id ASC`;
+      break;
+    }
+    case "from": {
+      sortByClause = `JSON_VALUE(properties, '$.variant.from') ${direction}, sent_at DESC, origin_message_id ASC`;
+      break;
+    }
+    case "to": {
+      sortByClause = `JSON_VALUE(properties, '$.variant.to') ${direction}, sent_at DESC, origin_message_id ASC`;
+      break;
+    }
+    default: {
+      assertUnreachable(sortBy);
+    }
+  }
+
+  const messageSendsCteQuery = `${queryBody.messageSendsCte.head}${
+    innerLimit ? `\n        ${innerLimit}` : ""
+  }${queryBody.messageSendsCte.tail}`;
+
+  const query = `
+    WITH message_sends AS (
+${messageSendsCteQuery}
+    ),
+    status_events AS (
+${queryBody.statusEventsCte}
+    )${
+      queryBody.triggeringEventsCte
+        ? `,
+    triggering_events AS (
+${queryBody.triggeringEventsCte}
+    )`
+        : ""
+    }
+    SELECT
+      if(se.origin_message_id != '', se.last_event, '${InternalEventType.MessageSent}') as last_event,
+      uev.properties as properties,
+      JSONExtractString(uev.message_raw, 'context') as context,
+      if(se.origin_message_id != '', se.max_event_time, ms.event_time) as updated_at,
+      ms.event_time as sent_at,
+      ms.user_or_anonymous_id as user_or_anonymous_id,
+      ms.message_id as origin_message_id,
+      ms.triggering_message_id as triggering_message_id,
+      ms.workspace_id as workspace_id,
+      if(uev.anonymous_id != '', 1, 0) as is_anonymous
+${queryBody.fromClause}
+    ORDER BY ${sortByClause}${
+      outerLimit
+        ? `
+    ${outerLimit}`
+        : ""
+    }
   `;
 
   return {
     query,
     queryParams: qb.getQueries(),
   };
+}
+
+export async function searchDeliveriesCount(
+  params: SearchDeliveriesRequest & {
+    abortSignal?: AbortSignal;
+  },
+): Promise<number> {
+  const { abortSignal, ...searchParams } = params;
+  const qb = new ClickHouseQueryBuilder();
+
+  const queryBody = buildDeliverySearchQueryBody({
+    params: searchParams,
+    qb,
+  });
+
+  const messageSendsCteQuery = `${queryBody.messageSendsCte.head}${queryBody.messageSendsCte.tail}`;
+
+  const query = `
+    WITH message_sends AS (
+${messageSendsCteQuery}
+    ),
+    status_events AS (
+${queryBody.statusEventsCte}
+    )${
+      queryBody.triggeringEventsCte
+        ? `,
+    triggering_events AS (
+${queryBody.triggeringEventsCte}
+    )`
+        : ""
+    }
+    SELECT count() AS count
+${queryBody.fromClause}
+  `;
+
+  logger().debug(
+    {
+      query,
+      queryParams: qb.getQueries(),
+    },
+    "searchDeliveriesCount query",
+  );
+
+  const resultSet = await chQuery({
+    query,
+    query_params: qb.getQueries(),
+    format: "JSONEachRow",
+    clickhouse_settings: {
+      date_time_output_format: "iso",
+      function_json_value_return_type_allow_complex: 1,
+    },
+    abort_signal: abortSignal,
+  });
+
+  const rows = await resultSet.json<{ count: number | string }>();
+  const rawCount = rows[0]?.count;
+  return typeof rawCount === "number" ? rawCount : Number(rawCount ?? 0);
 }
 
 export const SearchDeliveryRow = Type.Object({
@@ -674,91 +816,148 @@ export async function searchDeliveries({
 }: SearchDeliveriesRequest & {
   abortSignal?: AbortSignal;
 }): Promise<SearchDeliveriesResponse> {
-  const queryBuilder = new ClickHouseQueryBuilder();
-
-  const { query, queryParams } = buildDeliverySearchQuery(
-    {
-      workspaceId,
-      cursor,
-      limit,
-      journeyId,
-      sortBy,
-      sortDirection,
-      channels,
-      userId,
-      to,
-      from,
-      statuses,
-      templateIds,
-      startDate,
-      endDate,
-      groupId,
-      broadcastId,
-      triggeringProperties: triggeringPropertiesInput,
-      contextValues: contextValuesInput,
-    },
-    queryBuilder,
-  );
-
-  const offset = parseCursorOffset(cursor);
-  logger().debug(
-    {
-      query,
-      queryParams,
-    },
-    "searchDeliveries query",
-  );
-
-  const result = await chQuery({
-    query,
-    query_params: queryParams,
-    format: "JSONEachRow",
-    clickhouse_settings: {
-      date_time_output_format: "iso",
-      function_json_value_return_type_allow_complex: 1,
-    },
-    abort_signal: abortSignal,
-  });
-
-  const items: SearchDeliveriesResponseItem[] = [];
-  await streamClickhouseQuery(result, (rows) => {
-    for (const row of rows) {
-      const parseResult = schemaValidateWithErr(row, SearchDeliveryRow);
-      if (parseResult.isErr()) {
-        logger().error(
-          {
-            err: parseResult.error,
-            workspaceId,
-            journeyId,
-            userId,
-            row,
-          },
-          "Failed to parse delivery row",
-        );
-        continue;
-      }
-      const parsedRow = parseResult.value;
-      const parsedItem = parseSearchDeliveryRow(parsedRow);
-      if (!parsedItem) {
-        continue;
-      }
-      items.push(parsedItem);
+  return withSpan({ name: "search-deliveries" }, async (span) => {
+    span.setAttribute("workspaceId", workspaceId);
+    span.setAttribute("limit", limit);
+    span.setAttribute("sortBy", sortBy);
+    span.setAttribute("sortDirection", sortDirection);
+    if (journeyId) {
+      span.setAttribute("journeyId", journeyId);
     }
+    if (broadcastId) {
+      span.setAttribute("broadcastId", broadcastId);
+    }
+    if (channels) {
+      span.setAttribute("channels", channels);
+    }
+    if (userId) {
+      span.setAttribute(
+        "userIdCount",
+        Array.isArray(userId) ? userId.length : 1,
+      );
+    }
+    if (to) {
+      span.setAttribute("toCount", to.length);
+    }
+    if (from) {
+      span.setAttribute("fromCount", from.length);
+    }
+    if (statuses) {
+      span.setAttribute("statuses", statuses);
+    }
+    if (templateIds) {
+      span.setAttribute("templateIdsCount", templateIds.length);
+    }
+    if (startDate) {
+      span.setAttribute("startDate", startDate);
+    }
+    if (endDate) {
+      span.setAttribute("endDate", endDate);
+    }
+    if (groupId) {
+      span.setAttribute(
+        "groupIdCount",
+        Array.isArray(groupId) ? groupId.length : 1,
+      );
+    }
+    if (triggeringPropertiesInput) {
+      span.setAttribute(
+        "triggeringPropertiesCount",
+        triggeringPropertiesInput.length,
+      );
+    }
+    if (contextValuesInput) {
+      span.setAttribute("contextValuesCount", contextValuesInput.length);
+    }
+
+    const queryBuilder = new ClickHouseQueryBuilder();
+
+    const { query, queryParams } = buildDeliverySearchQuery({
+      params: {
+        workspaceId,
+        cursor,
+        limit,
+        journeyId,
+        sortBy,
+        sortDirection,
+        channels,
+        userId,
+        to,
+        from,
+        statuses,
+        templateIds,
+        startDate,
+        endDate,
+        groupId,
+        broadcastId,
+        triggeringProperties: triggeringPropertiesInput,
+        contextValues: contextValuesInput,
+      },
+      qb: queryBuilder,
+    });
+
+    const offset = parseCursorOffset(cursor);
+    logger().debug(
+      {
+        query,
+        queryParams,
+      },
+      "searchDeliveries query",
+    );
+
+    const result = await chQuery({
+      query,
+      query_params: queryParams,
+      format: "JSONEachRow",
+      clickhouse_settings: {
+        date_time_output_format: "iso",
+        function_json_value_return_type_allow_complex: 1,
+      },
+      abort_signal: abortSignal,
+    });
+
+    const items: SearchDeliveriesResponseItem[] = [];
+    await streamClickhouseQuery(result, (rows) => {
+      for (const row of rows) {
+        const parseResult = schemaValidateWithErr(row, SearchDeliveryRow);
+        if (parseResult.isErr()) {
+          logger().error(
+            {
+              err: parseResult.error,
+              workspaceId,
+              journeyId,
+              userId,
+              row,
+            },
+            "Failed to parse delivery row",
+          );
+          continue;
+        }
+        const parsedRow = parseResult.value;
+        const parsedItem = parseSearchDeliveryRow(parsedRow);
+        if (!parsedItem) {
+          continue;
+        }
+        items.push(parsedItem);
+      }
+    });
+
+    span.setAttribute("itemsCount", items.length);
+
+    const responseCursor =
+      items.length >= limit ? serializeCursorOffset(offset + limit) : undefined;
+
+    const previousOffset = Math.max(offset - limit, 0);
+    const responsePreviousCursor =
+      offset > 0 ? serializeCursorOffset(previousOffset) : undefined;
+
+    return {
+      workspaceId,
+      items,
+      cursor: responseCursor,
+      previousCursor: responsePreviousCursor,
+    };
   });
-
-  const responseCursor =
-    items.length >= limit ? serializeCursorOffset(offset + limit) : undefined;
-
-  const previousOffset = Math.max(offset - limit, 0);
-  const responsePreviousCursor =
-    offset > 0 ? serializeCursorOffset(previousOffset) : undefined;
-
-  return {
-    workspaceId,
-    items,
-    cursor: responseCursor,
-    previousCursor: responsePreviousCursor,
-  };
 }
 
 export async function buildDeliveriesFile(

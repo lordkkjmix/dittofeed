@@ -19,6 +19,9 @@ import { publicDrizzleMigrate } from "backend-lib/src/migrate";
 import {
   EmailProviderSecret,
   EmailProviderType,
+  SegmentDefinition,
+  SegmentNodeType,
+  SegmentOperatorType,
   Workspace,
 } from "backend-lib/src/types";
 import {
@@ -26,6 +29,13 @@ import {
   CREATE_INTERNAL_EVENTS_TABLE_MATERIALIZED_VIEW_QUERY,
   CREATE_INTERNAL_EVENTS_TABLE_QUERY,
   CREATE_UPDATED_COMPUTED_PROPERTY_STATE_V3_MV_QUERY,
+  CREATE_USER_PROPERTY_IDX_DATE_MV_QUERY,
+  CREATE_USER_PROPERTY_IDX_DATE_QUERY,
+  CREATE_USER_PROPERTY_IDX_NUM_MV_QUERY,
+  CREATE_USER_PROPERTY_IDX_NUM_QUERY,
+  CREATE_USER_PROPERTY_IDX_STR_MV_QUERY,
+  CREATE_USER_PROPERTY_IDX_STR_QUERY,
+  CREATE_USER_PROPERTY_INDEX_CONFIG_QUERY,
   createUserEventsTables,
   GROUP_MATERIALIZED_VIEWS,
   GROUP_TABLES,
@@ -37,6 +47,29 @@ import { unwrap } from "isomorphic-lib/src/resultHandling/resultUtils";
 import { schemaValidateWithErr } from "isomorphic-lib/src/resultHandling/schemaValidation";
 
 import { spawnWithEnv, spawnWithEnvSafe } from "./spawn";
+
+export async function createUserSortingIndexTables() {
+  logger().info("Creating user sorting index tables and materialized views.");
+  const queries = [
+    CREATE_USER_PROPERTY_INDEX_CONFIG_QUERY,
+    CREATE_USER_PROPERTY_IDX_NUM_QUERY,
+    CREATE_USER_PROPERTY_IDX_STR_QUERY,
+    CREATE_USER_PROPERTY_IDX_DATE_QUERY,
+    CREATE_USER_PROPERTY_IDX_NUM_MV_QUERY,
+    CREATE_USER_PROPERTY_IDX_STR_MV_QUERY,
+    CREATE_USER_PROPERTY_IDX_DATE_MV_QUERY,
+  ];
+
+  for (const q of queries) {
+    await command({
+      query: q,
+      clickhouse_settings: {
+        wait_end_of_query: 1,
+      },
+    });
+  }
+  logger().info("Finished creating user sorting index tables and views.");
+}
 
 export async function disentangleResendSendgrid() {
   logger().info("Disentangling resend and sendgrid email providers.");
@@ -273,6 +306,95 @@ export async function upgradeV021Pre() {
   logger().info("Pre-upgrade steps for v0.21.0 completed.");
 }
 
+export async function refreshNotExistsSegmentDefinitionUpdatedAt() {
+  logger().info(
+    "Refreshing definitionUpdatedAt for segments with NotExists trait nodes",
+  );
+
+  const now = new Date();
+  const batchSize = 100;
+
+  await db().transaction(async (tx) => {
+    let offset = 0;
+    const allIdsToUpdate: string[] = [];
+
+    // Paginate through running segments in stable batches.
+    // We use limit/offset inside a transaction to get a consistent snapshot.
+    // If the dataset grows significantly, we can revisit this to use keyset
+    // pagination, but this is acceptable for an upgrade script.
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const segments = await tx.query.segment.findMany({
+        where: eq(schema.segment.status, "Running"),
+        limit: batchSize,
+        offset,
+      });
+
+      if (!segments.length) {
+        break;
+      }
+
+      for (const seg of segments) {
+        try {
+          const parsed = schemaValidateWithErr(
+            seg.definition,
+            SegmentDefinition,
+          );
+          if (parsed.isErr()) {
+            logger().error(
+              { segmentId: seg.id, err: parsed.error },
+              "Failed to parse segment definition JSON when searching for NotExists nodes",
+            );
+            // eslint-disable-next-line no-continue
+            continue;
+          }
+          const definition = parsed.value;
+
+          const { nodes } = definition;
+          const allNodes = [definition.entryNode, ...nodes];
+
+          const hasNotExistsTraitNode = allNodes.some(
+            (node) =>
+              node.type === SegmentNodeType.Trait &&
+              "operator" in node &&
+              node.operator.type === SegmentOperatorType.NotExists,
+          );
+
+          if (hasNotExistsTraitNode) {
+            allIdsToUpdate.push(seg.id);
+          }
+        } catch (err) {
+          logger().error(
+            { segmentId: seg.id, err },
+            "Error while inspecting segment definition for NotExists nodes",
+          );
+        }
+      }
+
+      offset += segments.length;
+    }
+
+    if (allIdsToUpdate.length > 0) {
+      await tx
+        .update(schema.segment)
+        .set({
+          definitionUpdatedAt: now,
+          updatedAt: now,
+        })
+        .where(inArray(schema.segment.id, allIdsToUpdate));
+
+      logger().info(
+        { totalUpdated: allIdsToUpdate.length },
+        "Completed refreshing definitionUpdatedAt for segments with NotExists trait nodes",
+      );
+    } else {
+      logger().info(
+        "No segments with NotExists trait nodes found during refresh operation",
+      );
+    }
+  });
+}
+
 export function transferComputedPropertyStateV2ToV3Query({
   excludeWorkspaceIds,
   limit,
@@ -465,17 +587,14 @@ export async function createComputedPropertyStateV3() {
     "Creating computed_property_state_v3 table and materialized view",
   );
 
-  await Promise.all(
-    [
-      CREATE_COMPUTED_PROPERTY_STATE_V3_TABLE_QUERY,
-      CREATE_UPDATED_COMPUTED_PROPERTY_STATE_V3_MV_QUERY,
-    ].map((queryString) =>
-      command({
-        query: queryString,
-        clickhouse_settings: { wait_end_of_query: 1 },
-      }),
-    ),
-  );
+  await command({
+    query: CREATE_COMPUTED_PROPERTY_STATE_V3_TABLE_QUERY,
+    clickhouse_settings: { wait_end_of_query: 1 },
+  });
+  await command({
+    query: CREATE_UPDATED_COMPUTED_PROPERTY_STATE_V3_MV_QUERY,
+    clickhouse_settings: { wait_end_of_query: 1 },
+  });
 
   logger().info(
     "Finished creating computed_property_state_v3 table and materialized view",
@@ -926,5 +1045,12 @@ export async function upgradeV023Post() {
   logger().info("Performing post-upgrade steps for v0.23.0");
   await resetGlobalCron();
   await startComputePropertiesWorkflowGlobal();
+  await refreshNotExistsSegmentDefinitionUpdatedAt();
   logger().info("Post-upgrade steps for v0.23.0 completed.");
+}
+
+export async function upgradeV024Pre() {
+  logger().info("Performing pre-upgrade steps for v0.24.0");
+  await createUserSortingIndexTables();
+  logger().info("Pre-upgrade steps for v0.24.0 completed.");
 }

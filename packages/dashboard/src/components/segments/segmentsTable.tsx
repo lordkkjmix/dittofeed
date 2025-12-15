@@ -3,6 +3,7 @@ import {
   ArrowDownward,
   ArrowUpward,
   Computer,
+  ContentCopy as ContentCopyIcon,
   Delete as DeleteIcon,
   DownloadForOffline,
   Home,
@@ -12,6 +13,8 @@ import {
   KeyboardDoubleArrowRight,
   MoreVert as MoreVertIcon,
   OpenInNew as OpenInNewIcon,
+  Pause as PauseIcon,
+  PlayArrow as PlayArrowIcon,
   UnfoldMore,
 } from "@mui/icons-material";
 import { LoadingButton } from "@mui/lab";
@@ -60,9 +63,11 @@ import { DEFAULT_SEGMENT_DEFINITION } from "isomorphic-lib/src/constants";
 import {
   CompletionStatus,
   ComputedPropertyPeriod,
+  DuplicateResourceTypeEnum,
   MinimalJourneysResource,
   SegmentDefinition,
   SegmentResource,
+  SegmentStatusEnum,
 } from "isomorphic-lib/src/types";
 import Link from "next/link";
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -73,17 +78,20 @@ import { useUniversalRouter } from "../../lib/authModeProvider";
 import { useComputedPropertyPeriodsQuery } from "../../lib/useComputedPropertyPeriodsQuery";
 import { useDeleteSegmentMutation } from "../../lib/useDeleteSegmentMutation";
 import { useDownloadSegmentsMutation } from "../../lib/useDownloadSegmentsMutation";
+import { useDuplicateResourceMutation } from "../../lib/useDuplicateResourceMutation";
 import { useResourcesQuery } from "../../lib/useResourcesQuery";
 import {
   SEGMENTS_QUERY_KEY,
   useSegmentsQuery,
 } from "../../lib/useSegmentsQuery";
+import { useSegmentStatusMutation } from "../../lib/useSegmentStatusMutation";
 import { useUpdateSegmentsMutation } from "../../lib/useUpdateSegmentsMutation";
 import { GreyButton, greyButtonStyle } from "../greyButtonStyle";
 import { RelatedResourceSelect } from "../resourceTable";
 
 export type SegmentsAllowedColumn =
   | "name"
+  | "status"
   | "journeysUsedBy"
   | "lastRecomputed"
   | "updatedAt"
@@ -91,6 +99,7 @@ export type SegmentsAllowedColumn =
 
 export const DEFAULT_ALLOWED_SEGMENTS_COLUMNS: SegmentsAllowedColumn[] = [
   "name",
+  "status",
   "journeysUsedBy",
   "lastRecomputed",
   "updatedAt",
@@ -164,13 +173,27 @@ function TimeCell({ getValue }: CellContext<Row, unknown>) {
   );
 }
 
+function StatusCell({ getValue }: CellContext<Row, unknown>) {
+  const status = getValue<string | undefined>();
+
+  if (!status) {
+    return null;
+  }
+
+  return <Typography variant="body2">{status}</Typography>;
+}
+
 // Cell renderer for Actions column
 function ActionsCell({ row, table }: CellContext<Row, unknown>) {
   const theme = useTheme();
   const rowId = row.original.id;
+  const rowName = row.original.name;
+  const rowStatus = row.original.status;
 
-  // Access delete function from table meta
+  // Access functions from table meta
   const deleteSegment = table.options.meta?.deleteSegment;
+  const duplicateSegment = table.options.meta?.duplicateSegment;
+  const toggleSegmentStatus = table.options.meta?.toggleSegmentStatus;
 
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const open = Boolean(anchorEl);
@@ -180,6 +203,27 @@ function ActionsCell({ row, table }: CellContext<Row, unknown>) {
   };
   const handleClose = () => {
     setAnchorEl(null);
+  };
+
+  const handleDuplicate = () => {
+    if (!duplicateSegment) {
+      console.error("duplicateSegment function not found in table meta");
+      return;
+    }
+    duplicateSegment(rowName);
+    handleClose();
+  };
+
+  const handleToggleStatus = () => {
+    if (!toggleSegmentStatus) {
+      return;
+    }
+    const newStatus =
+      rowStatus === SegmentStatusEnum.Running
+        ? SegmentStatusEnum.Paused
+        : SegmentStatusEnum.Running;
+    toggleSegmentStatus(rowId, newStatus);
+    handleClose();
   };
 
   const handleDelete = () => {
@@ -220,6 +264,23 @@ function ActionsCell({ row, table }: CellContext<Row, unknown>) {
           },
         }}
       >
+        <MenuItem onClick={handleToggleStatus}>
+          {rowStatus === SegmentStatusEnum.Running ? (
+            <>
+              <PauseIcon fontSize="small" sx={{ mr: 1 }} />
+              Pause
+            </>
+          ) : (
+            <>
+              <PlayArrowIcon fontSize="small" sx={{ mr: 1 }} />
+              Resume
+            </>
+          )}
+        </MenuItem>
+        <MenuItem onClick={handleDuplicate}>
+          <ContentCopyIcon fontSize="small" sx={{ mr: 1 }} />
+          Duplicate
+        </MenuItem>
         <MenuItem
           onClick={handleDelete}
           sx={{ color: theme.palette.error.main }}
@@ -372,6 +433,43 @@ export function SegmentsTable({
     },
   });
 
+  const duplicateSegmentMutation = useDuplicateResourceMutation({
+    onSuccess: (data) => {
+      setSnackbarMessage(`Segment duplicated as "${data.name}"!`);
+      setSnackbarOpen(true);
+    },
+    onError: (error) => {
+      console.error("Failed to duplicate segment:", error);
+      const errorMsg =
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+        (error as AxiosError<{ message?: string }>).response?.data.message ??
+        "API Error";
+      setSnackbarMessage(`Failed to duplicate segment: ${errorMsg}`);
+      setSnackbarOpen(true);
+    },
+  });
+
+  const statusMutation = useSegmentStatusMutation();
+
+  const handleToggleSegmentStatus = (
+    segmentId: string,
+    newStatus: "NotStarted" | "Running" | "Paused",
+  ) => {
+    statusMutation.mutate(
+      { id: segmentId, status: newStatus },
+      {
+        onSuccess: () => {
+          setSnackbarMessage("Segment status updated successfully!");
+          setSnackbarOpen(true);
+        },
+        onError: () => {
+          setSnackbarMessage("Failed to update segment status.");
+          setSnackbarOpen(true);
+        },
+      },
+    );
+  };
+
   const createSegmentMutation = useUpdateSegmentsMutation({
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: [SEGMENTS_QUERY_KEY] });
@@ -399,6 +497,7 @@ export function SegmentsTable({
     onError: (error) => {
       console.error("Failed to download segments:", error);
       const errorMsg =
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
         (error as AxiosError<{ message?: string }>).response?.data.message ??
         "API Error";
       setSnackbarMessage(
@@ -433,6 +532,12 @@ export function SegmentsTable({
         header: "Name",
         accessorKey: "name",
         cell: NameCell,
+      },
+      status: {
+        id: "status",
+        header: "Status",
+        accessorKey: "status",
+        cell: StatusCell,
       },
       journeysUsedBy: {
         id: "journeysUsedBy",
@@ -477,12 +582,25 @@ export function SegmentsTable({
       pagination,
       sorting,
     },
-    // Pass the delete function via meta
+    // Pass functions via meta
     meta: {
       deleteSegment: (segmentId: string) => {
         if (deleteSegmentMutation.isPending) return;
         // Optional: Add confirmation dialog here
         deleteSegmentMutation.mutate(segmentId);
+      },
+      duplicateSegment: (originalSegmentName: string) => {
+        if (duplicateSegmentMutation.isPending) return;
+        duplicateSegmentMutation.mutate({
+          name: originalSegmentName,
+          resourceType: DuplicateResourceTypeEnum.Segment,
+        });
+      },
+      toggleSegmentStatus: (
+        segmentId: string,
+        newStatus: "NotStarted" | "Running" | "Paused",
+      ) => {
+        handleToggleSegmentStatus(segmentId, newStatus);
       },
     },
   });
@@ -563,6 +681,7 @@ export function SegmentsTable({
                               {{
                                 asc: <ArrowUpward fontSize="inherit" />,
                                 desc: <ArrowDownward fontSize="inherit" />,
+                                // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
                               }[header.column.getIsSorted() as string] ?? (
                                 <UnfoldMore
                                   fontSize="inherit"
@@ -754,5 +873,10 @@ declare module "@tanstack/react-table" {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   interface TableMeta<TData = unknown> {
     deleteSegment?: (segmentId: string) => void;
+    duplicateSegment?: (segmentName: string) => void;
+    toggleSegmentStatus?: (
+      segmentId: string,
+      newStatus: "NotStarted" | "Running" | "Paused",
+    ) => void;
   }
 }

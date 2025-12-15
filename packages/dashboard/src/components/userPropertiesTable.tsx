@@ -3,6 +3,7 @@ import {
   ArrowDownward,
   ArrowUpward,
   Computer,
+  ContentCopy as ContentCopyIcon,
   Delete as DeleteIcon,
   Home,
   KeyboardArrowLeft,
@@ -11,6 +12,8 @@ import {
   KeyboardDoubleArrowRight,
   MoreVert as MoreVertIcon,
   OpenInNew as OpenInNewIcon,
+  Pause as PauseIcon,
+  PlayArrow as PlayArrowIcon,
   UnfoldMore,
 } from "@mui/icons-material";
 import {
@@ -56,8 +59,10 @@ import formatDistanceToNow from "date-fns/formatDistanceToNow";
 import protectedUserProperties from "isomorphic-lib/src/protectedUserProperties";
 import {
   ComputedPropertyPeriod,
+  DuplicateResourceTypeEnum,
   SavedUserPropertyResource,
   UserPropertyDefinitionType,
+  UserPropertyStatusEnum,
 } from "isomorphic-lib/src/types";
 import Link from "next/link";
 import { useRouter } from "next/router";
@@ -66,21 +71,24 @@ import { v4 as uuid } from "uuid";
 
 import { useComputedPropertyPeriodsQuery } from "../lib/useComputedPropertyPeriodsQuery";
 import { useDeleteUserPropertyMutation } from "../lib/useDeleteUserPropertyMutation";
+import { useDuplicateResourceMutation } from "../lib/useDuplicateResourceMutation";
 import { useUpsertUserPropertyMutation } from "../lib/useUpsertUserPropertyMutation";
 import {
   USER_PROPERTIES_QUERY_KEY,
   useUserPropertiesQuery,
 } from "../lib/useUserPropertiesQuery";
+import { useUserPropertyStatusMutation } from "../lib/useUserPropertyStatusMutation";
 import { GreyButton, greyButtonStyle } from "./greyButtonStyle";
 
 export type UserPropertiesAllowedColumn =
   | "name"
+  | "status"
   | "lastRecomputed"
   | "updatedAt"
   | "actions";
 
 export const DEFAULT_ALLOWED_USER_PROPERTIES_COLUMNS: UserPropertiesAllowedColumn[] =
-  ["name", "lastRecomputed", "updatedAt", "actions"];
+  ["name", "status", "lastRecomputed", "updatedAt", "actions"];
 
 type Row = SavedUserPropertyResource & {
   disableDelete?: boolean;
@@ -151,9 +159,13 @@ function TimeCell({ getValue }: CellContext<Row, unknown>) {
 function ActionsCell({ row, table }: CellContext<Row, unknown>) {
   const theme = useTheme();
   const rowId = row.original.id;
+  const rowName = row.original.name;
+  const rowStatus = row.original.status;
   const isProtected = row.original.disableDelete;
 
   const deleteUserProperty = table.options.meta?.deleteUserProperty;
+  const duplicateUserProperty = table.options.meta?.duplicateUserProperty;
+  const toggleUserPropertyStatus = table.options.meta?.toggleUserPropertyStatus;
 
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const open = Boolean(anchorEl);
@@ -163,6 +175,29 @@ function ActionsCell({ row, table }: CellContext<Row, unknown>) {
   };
   const handleClose = () => {
     setAnchorEl(null);
+  };
+
+  const handleDuplicate = () => {
+    if (!duplicateUserProperty || isProtected) {
+      console.error(
+        "duplicateUserProperty function not found in table meta or user property is protected",
+      );
+      return;
+    }
+    duplicateUserProperty(rowName);
+    handleClose();
+  };
+
+  const handleToggleStatus = () => {
+    if (!toggleUserPropertyStatus) {
+      return;
+    }
+    const newStatus =
+      rowStatus === UserPropertyStatusEnum.Running
+        ? UserPropertyStatusEnum.Paused
+        : UserPropertyStatusEnum.Running;
+    toggleUserPropertyStatus(rowId, newStatus);
+    handleClose();
   };
 
   const handleDelete = () => {
@@ -204,6 +239,23 @@ function ActionsCell({ row, table }: CellContext<Row, unknown>) {
           },
         }}
       >
+        <MenuItem onClick={handleToggleStatus} disabled={isProtected}>
+          {rowStatus === UserPropertyStatusEnum.Running ? (
+            <>
+              <PauseIcon fontSize="small" sx={{ mr: 1 }} />
+              Pause
+            </>
+          ) : (
+            <>
+              <PlayArrowIcon fontSize="small" sx={{ mr: 1 }} />
+              Resume
+            </>
+          )}
+        </MenuItem>
+        <MenuItem onClick={handleDuplicate} disabled={isProtected}>
+          <ContentCopyIcon fontSize="small" sx={{ mr: 1 }} />
+          Duplicate
+        </MenuItem>
         <MenuItem
           onClick={handleDelete}
           disabled={isProtected}
@@ -251,6 +303,16 @@ function NameCell({ row, getValue }: CellContext<Row, unknown>) {
       </Tooltip>
     </Stack>
   );
+}
+
+function StatusCell({ getValue }: CellContext<Row, unknown>) {
+  const status = getValue<string | undefined>();
+
+  if (!status) {
+    return null;
+  }
+
+  return <Typography variant="body2">{status}</Typography>;
 }
 
 export default function UserPropertiesTable({
@@ -325,6 +387,21 @@ export default function UserPropertiesTable({
     },
   });
 
+  const duplicateUserPropertyMutation = useDuplicateResourceMutation({
+    onSuccess: (data) => {
+      setSnackbarMessage(`User property duplicated as "${data.name}"!`);
+      setSnackbarOpen(true);
+    },
+    onError: (error) => {
+      console.error("Failed to duplicate user property:", error);
+      const errorMsg =
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+        (error.response?.data as { message?: string }).message ?? "API Error";
+      setSnackbarMessage(`Failed to duplicate user property: ${errorMsg}`);
+      setSnackbarOpen(true);
+    },
+  });
+
   const createUserPropertyMutation = useUpsertUserPropertyMutation({
     onSuccess: (data) => {
       queryClient.invalidateQueries({
@@ -342,6 +419,27 @@ export default function UserPropertiesTable({
       setSnackbarOpen(true);
     },
   });
+
+  const statusMutation = useUserPropertyStatusMutation();
+
+  const handleToggleUserPropertyStatus = (
+    userPropertyId: string,
+    newStatus: "NotStarted" | "Running" | "Paused",
+  ) => {
+    statusMutation.mutate(
+      { id: userPropertyId, status: newStatus },
+      {
+        onSuccess: () => {
+          setSnackbarMessage("User property status updated successfully!");
+          setSnackbarOpen(true);
+        },
+        onError: () => {
+          setSnackbarMessage("Failed to update user property status.");
+          setSnackbarOpen(true);
+        },
+      },
+    );
+  };
 
   const handleCreateUserProperty = () => {
     if (userPropertyName.trim() && !createUserPropertyMutation.isPending) {
@@ -372,6 +470,12 @@ export default function UserPropertiesTable({
         header: "Name",
         accessorKey: "name",
         cell: NameCell,
+      },
+      status: {
+        id: "status",
+        header: "Status",
+        accessorKey: "status",
+        cell: StatusCell,
       },
       lastRecomputed: {
         id: "lastRecomputed",
@@ -413,6 +517,19 @@ export default function UserPropertiesTable({
       deleteUserProperty: (userPropertyId: string) => {
         if (deleteUserPropertyMutation.isPending) return;
         deleteUserPropertyMutation.mutate(userPropertyId);
+      },
+      duplicateUserProperty: (name: string) => {
+        if (duplicateUserPropertyMutation.isPending) return;
+        duplicateUserPropertyMutation.mutate({
+          name,
+          resourceType: DuplicateResourceTypeEnum.UserProperty,
+        });
+      },
+      toggleUserPropertyStatus: (
+        userPropertyId: string,
+        newStatus: "NotStarted" | "Running" | "Paused",
+      ) => {
+        handleToggleUserPropertyStatus(userPropertyId, newStatus);
       },
     },
   });
@@ -480,6 +597,7 @@ export default function UserPropertiesTable({
                               {{
                                 asc: <ArrowUpward fontSize="inherit" />,
                                 desc: <ArrowDownward fontSize="inherit" />,
+                                // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
                               }[header.column.getIsSorted() as string] ?? (
                                 <UnfoldMore
                                   fontSize="inherit"
@@ -669,5 +787,10 @@ declare module "@tanstack/react-table" {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   interface TableMeta<TData = unknown> {
     deleteUserProperty?: (userPropertyId: string) => void;
+    duplicateUserProperty?: (userPropertyName: string) => void;
+    toggleUserPropertyStatus?: (
+      userPropertyId: string,
+      newStatus: "NotStarted" | "Running" | "Paused",
+    ) => void;
   }
 }

@@ -92,6 +92,9 @@ const BaseRawConfigProps = {
   computePropertiesAttempts: Type.Optional(
     Type.String({ format: "naturalNumber" }),
   ),
+  computePropertiesJitterMs: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
   secretKey: Type.Optional(Type.String()),
   password: Type.Optional(Type.String()),
   computePropertiesWorkflowTaskTimeout: Type.Optional(
@@ -161,6 +164,12 @@ const BaseRawConfigProps = {
   ),
   computePropertiesSplit: Type.Optional(BoolStr),
   computePropertiesTimeout: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  waitForComputePropertiesBaseDelayMs: Type.Optional(
+    Type.String({ format: "naturalNumber" }),
+  ),
+  waitForComputePropertiesMaxAttempts: Type.Optional(
     Type.String({ format: "naturalNumber" }),
   ),
   // OpenTelemetry metrics export interval (milliseconds)
@@ -253,6 +262,7 @@ export type Config = Overwrite<
     computedPropertiesTopicName: string;
     computePropertiesAttempts: number;
     computePropertiesInterval: number;
+    computePropertiesJitterMs: number;
     computePropertiesQueueCapacity: number;
     computePropertiesQueueConcurrency: number;
     computePropertiesSchedulerInterval: number;
@@ -299,6 +309,8 @@ export type Config = Overwrite<
     clickhouseMaxBytesRatioBeforeExternalGroupBy?: number;
     computePropertiesSplit: boolean;
     computePropertiesTimeout: number;
+    waitForComputePropertiesBaseDelayMs: number;
+    waitForComputePropertiesMaxAttempts: number;
     metricsExportIntervalMs: number;
     batchChunkSize: number;
     // Cold storage timeouts (ms)
@@ -598,6 +610,9 @@ function parseRawConfig(rawConfig: RawConfig): Config {
     computePropertiesInterval: rawConfig.computePropertiesInterval
       ? parseInt(rawConfig.computePropertiesInterval)
       : 120 * 1000,
+    computePropertiesJitterMs: rawConfig.computePropertiesJitterMs
+      ? parseInt(rawConfig.computePropertiesJitterMs)
+      : 0,
     signoutUrl:
       authMode === "single-tenant"
         ? "/api/public/single-tenant/signout"
@@ -683,6 +698,14 @@ function parseRawConfig(rawConfig: RawConfig): Config {
     computePropertiesTimeout: rawConfig.computePropertiesTimeout
       ? parseInt(rawConfig.computePropertiesTimeout)
       : 5 * 60 * 1000,
+    waitForComputePropertiesBaseDelayMs:
+      rawConfig.waitForComputePropertiesBaseDelayMs
+        ? parseInt(rawConfig.waitForComputePropertiesBaseDelayMs)
+        : 10_000,
+    waitForComputePropertiesMaxAttempts:
+      rawConfig.waitForComputePropertiesMaxAttempts
+        ? parseInt(rawConfig.waitForComputePropertiesMaxAttempts)
+        : 5,
     metricsExportIntervalMs: rawConfig.metricsExportIntervalMs
       ? parseInt(rawConfig.metricsExportIntervalMs)
       : 60 * 1000,

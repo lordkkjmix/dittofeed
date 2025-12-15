@@ -3,6 +3,7 @@ import {
   ArrowDownward,
   ArrowUpward,
   Computer,
+  ContentCopy as ContentCopyIcon,
   Delete as DeleteIcon,
   Home,
   KeyboardArrowLeft,
@@ -51,11 +52,13 @@ import {
   SortingState,
   useReactTable,
 } from "@tanstack/react-table";
+import { AxiosError } from "axios";
 import formatDistanceToNow from "date-fns/formatDistanceToNow";
 import { assertUnreachable } from "isomorphic-lib/src/typeAssertions";
 import {
   ChannelType,
   CompletionStatus,
+  DuplicateResourceTypeEnum,
   EmailContentsType,
   MessageTemplateConfiguration,
   MessageTemplateResource,
@@ -73,6 +76,7 @@ import {
   DeleteMessageTemplateVariables,
   useDeleteMessageTemplateMutation,
 } from "../../lib/useDeleteMessageTemplateMutation";
+import { useDuplicateResourceMutation } from "../../lib/useDuplicateResourceMutation";
 import { useMessageTemplatesQuery } from "../../lib/useMessageTemplatesQuery";
 import {
   UpsertMessageTemplateParams,
@@ -156,7 +160,11 @@ function TimeCell({ getValue }: CellContext<Row, unknown>) {
 function ActionsCell({ row, table }: CellContext<Row, unknown>) {
   const theme = useTheme();
   const { id: rowId, definition } = row.original;
+  const rowName = row.original.name;
+
+  // Access functions from table meta
   const deleteMessageTemplate = table.options.meta?.deleteMessageTemplate;
+  const duplicateMessageTemplate = table.options.meta?.duplicateMessageTemplate;
   const isDeleting = table.options.meta?.isDeletingTemplateId === rowId;
 
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
@@ -167,6 +175,17 @@ function ActionsCell({ row, table }: CellContext<Row, unknown>) {
   };
   const handleClose = () => {
     setAnchorEl(null);
+  };
+
+  const handleDuplicate = () => {
+    if (!duplicateMessageTemplate) {
+      console.error(
+        "duplicateMessageTemplate function not found in table meta",
+      );
+      return;
+    }
+    duplicateMessageTemplate(rowName);
+    handleClose();
   };
 
   const handleDelete = () => {
@@ -210,6 +229,10 @@ function ActionsCell({ row, table }: CellContext<Row, unknown>) {
         transformOrigin={{ vertical: "top", horizontal: "right" }}
         PaperProps={{ sx: { borderRadius: 1, boxShadow: theme.shadows[2] } }}
       >
+        <MenuItem onClick={handleDuplicate}>
+          <ContentCopyIcon fontSize="small" sx={{ mr: 1 }} />
+          Duplicate
+        </MenuItem>
         <MenuItem
           onClick={handleDelete}
           sx={{ color: theme.palette.error.main }}
@@ -381,6 +404,22 @@ export default function TemplatesTable({
     onError: (error) => {
       const errorMsg = error.message || "Failed to delete template.";
       setSnackbarMessage(errorMsg);
+      setSnackbarOpen(true);
+    },
+  });
+
+  const duplicateTemplateMutation = useDuplicateResourceMutation({
+    onSuccess: (data) => {
+      setSnackbarMessage(`Template duplicated as "${data.name}"!`);
+      setSnackbarOpen(true);
+    },
+    onError: (error) => {
+      console.error("Failed to duplicate template:", error);
+      const errorMsg =
+        // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+        (error as AxiosError<{ message?: string }>).response?.data.message ??
+        "API Error";
+      setSnackbarMessage(`Failed to duplicate template: ${errorMsg}`);
       setSnackbarOpen(true);
     },
   });
@@ -589,6 +628,13 @@ export default function TemplatesTable({
         if (deleteTemplateMutation.isPending) return;
         deleteTemplateMutation.mutate(variables);
       },
+      duplicateMessageTemplate: (templateName: string) => {
+        if (duplicateTemplateMutation.isPending) return;
+        duplicateTemplateMutation.mutate({
+          name: templateName,
+          resourceType: DuplicateResourceTypeEnum.MessageTemplate,
+        });
+      },
       isDeletingTemplateId: deleteTemplateMutation.isPending
         ? deleteTemplateMutation.variables.id // Access id from variables
         : null,
@@ -658,6 +704,7 @@ export default function TemplatesTable({
                             {{
                               asc: <ArrowUpward fontSize="inherit" />,
                               desc: <ArrowDownward fontSize="inherit" />,
+                              // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
                             }[header.column.getIsSorted() as string] ?? (
                               <UnfoldMore
                                 fontSize="inherit"
@@ -910,11 +957,12 @@ export default function TemplatesTable({
   );
 }
 
-// Add type definition for table meta for delete function
+// Add type definition for table meta for delete and duplicate functions
 declare module "@tanstack/react-table" {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   interface TableMeta<TData = unknown> {
     deleteMessageTemplate?: (variables: DeleteMessageTemplateVariables) => void;
+    duplicateMessageTemplate?: (templateName: string) => void;
     isDeletingTemplateId?: string | null; // To track which template is being deleted
   }
 }

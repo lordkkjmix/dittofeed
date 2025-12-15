@@ -266,6 +266,15 @@ export async function bootstrapPostgres({
       },
       exampleValue: "33.812511,-117.9189762",
     },
+    {
+      name: "timezone",
+      workspaceId,
+      definition: {
+        type: UserPropertyDefinitionType.Trait,
+        path: "timezone",
+      },
+      exampleValue: '"America/New_York"',
+    },
   ];
   if (userPropertyAllowList) {
     userProperties = userProperties.filter((up) =>
@@ -311,13 +320,6 @@ export async function bootstrapPostgres({
       name: `${workspaceName} - Email`,
       type: SubscriptionGroupType.OptOut,
       channel: ChannelType.Email,
-    }),
-    upsertSubscriptionGroup({
-      workspaceId,
-      id: uuidv5("mobile-push-subscription-group", workspaceId),
-      name: `${workspaceName} - Mobile Push`,
-      type: SubscriptionGroupType.OptOut,
-      channel: ChannelType.MobilePush,
     }),
     upsertSubscriptionGroup({
       workspaceId,

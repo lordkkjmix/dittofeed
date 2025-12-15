@@ -49,8 +49,22 @@ module.exports = {
         caughtErrorsIgnorePattern: "^_",
       },
     ],
+    "@typescript-eslint/naming-convention": [
+      "error",
+      {
+        selector: "variable",
+        format: ["camelCase", "PascalCase", "UPPER_CASE"],
+        leadingUnderscore: "allow",
+      },
+    ],
     "@typescript-eslint/no-unsafe-enum-comparison": "error",
     "@typescript-eslint/no-duplicate-enum-values": "error",
+    "@typescript-eslint/consistent-type-assertions": [
+      "error",
+      {
+        assertionStyle: "never",
+      },
+    ],
   },
   root: true,
 };
